@@ -32,6 +32,22 @@ behavior, persistent direct-provider leases, `--fresh-pr`, `--full-resync`,
 environment forwarding, capture/download support, or provider comparison. Use
 `--provider blacksmith-testbox` for the default OpenClaw agent path.
 
+## Provider Selection
+
+Apply source-trust, platform, and proof requirements before provider
+preference.
+
+1. Honor an explicit provider requested by the user when it is eligible.
+2. Apply required platform routing, such as Windows or WSL2 routing.
+3. For ordinary trusted maintainer heavy proof, explicitly use
+   `--provider blacksmith-testbox`.
+4. For other eligible Crabbox commands, omit `--provider` so the wrapper can
+   resolve `CRABBOX_PROVIDER` before the repository default.
+5. Run `local-container` through the Crabbox wrapper and report it as local
+   Docker proof, never remote or Testbox proof.
+6. Report the provider and lease id emitted by the wrapper; configuration only
+   describes a default, not the backend used by a particular run.
+
 ## First Checks
 
 - Run from the repo root. Crabbox sync mirrors the current checkout.

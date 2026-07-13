@@ -28,6 +28,13 @@ maintainer heavy proof defaults to Blacksmith Testbox. Untrusted contributor
 or fork code must use secretless fork CI or sanitized direct AWS Crabbox;
 never sync or run it on the credential-hydrated Blacksmith workflow.
 
+Honor an explicit user-requested provider when it satisfies those constraints.
+Otherwise, pass `--provider blacksmith-testbox` for ordinary trusted heavy
+proof. A configured provider controls only eligible wrapper calls that omit an
+explicit provider; it never overrides source-trust, platform, or proof
+requirements. If the wrapper selects `local-container`, run the command inside
+that Docker lease and report it as local Docker proof.
+
 Do not pre-warm for anticipated work. Acquire the backend lazily when the
 first heavy command is ready to run, save its id, reuse it for later heavy
 commands, and stop it before handoff. A single late heavy command can remain a
