@@ -740,6 +740,137 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
+  it("merges a form patch on top of a parseable dirty raw draft", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.setRaw('{\n  "count": 1,\n  "rawOnly": true\n}\n');
+    expect(runtimeConfig.state.configFormMode).toBe("raw");
+
+    // A Quick Settings patch lands on the shared capability: it must build on
+    // the parsed raw draft instead of the stale form.
+    runtimeConfig.patchForm(["count"], 7);
+    expect(runtimeConfig.state.configFormMode).toBe("form");
+
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(server.submissions).toHaveLength(1);
+    expect(JSON.parse(server.submissions[0]?.raw ?? "{}")).toEqual({ count: 7, rawOnly: true });
+    runtimeConfig.dispose();
+  });
+
+  it("refuses form patches while an unparseable raw draft is pending", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    const brokenRaw = '{\n  "count": broken';
+    runtimeConfig.setRaw(brokenRaw);
+    runtimeConfig.patchForm(["count"], 7);
+
+    // The raw draft stays authoritative; the form edit is rejected loudly.
+    expect(runtimeConfig.state.configRaw).toBe(brokenRaw);
+    expect(runtimeConfig.state.configFormMode).toBe("raw");
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("error");
+    expect(runtimeConfig.state.lastError).toContain("Raw editor");
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 2);
+    expect(server.submissions).toHaveLength(0);
+    runtimeConfig.dispose();
+  });
+
+  it("keeps the pending marker when a foreign write lands between ack and reload", async () => {
+    vi.useFakeTimers();
+    const store = stubLocalStorage();
+    let hashCounter = 1;
+    let storedRaw = '{\n  "count": 1\n}\n';
+    const request = vi.fn(async (method: string, params?: unknown) => {
+      if (method === "config.get") {
+        return {
+          config: JSON.parse(storedRaw) as Record<string, unknown>,
+          raw: storedRaw,
+          hash: `hash-${hashCounter}`,
+          valid: true,
+          issues: [],
+        };
+      }
+      if (method === "config.set") {
+        storedRaw = (params as { raw: string }).raw;
+        hashCounter += 1;
+        // Another writer changes the file before our reload lands.
+        storedRaw = '{\n  "count": 999\n}\n';
+        hashCounter += 1;
+        return {};
+      }
+      return {};
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+
+    // The reload returned foreign bytes: never adopt its hash as "our save".
+    expect([...store.values()]).toEqual(["__pending__"]);
+    expect(runtimeConfig.state.configNeedsApply).toBe(true);
+    runtimeConfig.dispose();
+  });
+
+  it("gates autosaves behind a fresh reload after an unconfirmed post-save reload", async () => {
+    vi.useFakeTimers();
+    let hashCounter = 1;
+    let storedRaw = '{\n  "count": 1\n}\n';
+    let failReloads = false;
+    const submissions: Array<{ raw: string; baseHash: string }> = [];
+    const request = vi.fn(async (method: string, params?: unknown) => {
+      if (method === "config.get") {
+        if (failReloads) {
+          throw new Error("gateway offline");
+        }
+        return {
+          config: JSON.parse(storedRaw) as Record<string, unknown>,
+          raw: storedRaw,
+          hash: `hash-${hashCounter}`,
+          valid: true,
+          issues: [],
+        };
+      }
+      if (method === "config.set") {
+        const { raw, baseHash } = params as { raw: string; baseHash: string };
+        submissions.push({ raw, baseHash });
+        storedRaw = raw;
+        hashCounter += 1;
+        return {};
+      }
+      return {};
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    failReloads = true;
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toEqual([{ raw: '{\n  "count": 2\n}\n', baseHash: "hash-1" }]);
+
+    // The post-save reload failed: the base hash is unknown, so further
+    // edits must not submit against the stale snapshot hash.
+    runtimeConfig.patchForm(["count"], 3);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 3);
+    expect(submissions).toHaveLength(1);
+    expect(runtimeConfig.state.configFormDirty).toBe(true);
+
+    // Once a reload succeeds, exactly one save goes out with the fresh hash.
+    failReloads = false;
+    runtimeConfig.patchForm(["count"], 4);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(2);
+    expect(submissions[1]).toEqual({ raw: '{\n  "count": 4\n}\n', baseHash: "hash-2" });
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
+    runtimeConfig.dispose();
+  });
+
   it("never auto-saves raw-text drafts and submits them on manual save", async () => {
     vi.useFakeTimers();
     const server = createConfigServerMock();

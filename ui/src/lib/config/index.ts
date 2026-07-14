@@ -1,7 +1,9 @@
 // Control UI runtime config capability and shared config-domain mutations.
+import JSON5 from "json5";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ConfigSchemaResponse, ConfigSnapshot, ConfigUiHints } from "../../api/types.ts";
 import { schemaType, type JsonSchema } from "../../components/config-form.shared.ts";
+import { t } from "../../i18n/index.ts";
 import { getSafeLocalStorage } from "../../local-storage.ts";
 import { copyToClipboard } from "../clipboard.ts";
 import {
@@ -114,6 +116,9 @@ type ConfigState = {
 };
 
 const autoAllowlistedPluginIdsByState = new WeakMap<ConfigState, Set<string>>();
+// States whose draft base hash is unknown because a post-save reload never
+// confirmed; autosaves must re-sync a snapshot before submitting again.
+const unknownBaseHashStates = new WeakSet<ConfigState>();
 const requestVersionsByState = new WeakMap<ConfigState, { config: number; schema: number }>();
 const connectionEpochsByState = new WeakMap<object, number>();
 
@@ -352,7 +357,14 @@ function applyConfigSnapshot(
   if (storedNeedsApply !== null) {
     state.configNeedsApply = storedNeedsApply;
   }
-  const draftBaseHash = state.configDraftBaseHash ?? state.configSnapshot?.hash ?? null;
+  // An unknown draft base (post-save reload never confirmed) adopts the
+  // fresh snapshot hash: the surviving draft was built on top of our own
+  // acknowledged write, and this snapshot is the first authoritative state
+  // seen since.
+  const draftBaseHash = unknownBaseHashStates.has(state)
+    ? (snapshot.hash ?? null)
+    : (state.configDraftBaseHash ?? state.configSnapshot?.hash ?? null);
+  unknownBaseHashStates.delete(state);
   state.configSnapshot = snapshot;
   const editableConfig = resolveEditableSnapshotConfig(snapshot);
   const rawAvailable =
@@ -602,7 +614,9 @@ async function submitConfigChange(
       return false;
     }
     state.configFormDirty = false;
-    state.configDraftBaseHash = null;
+    // configDraftBaseHash stays intact until the post-write reload is
+    // byte-confirmed below; clearing it early would make the next submit fall
+    // back onto the stale snapshot hash and manufacture a self-conflict.
     autoAllowlistedPluginIdsByState.delete(state);
     if (method === "config.apply") {
       // Applied config is now live; drop the persisted restart marker before
@@ -613,14 +627,25 @@ async function submitConfigChange(
     } else {
       state.configNeedsApply = true;
     }
-    const preReloadHash = state.configSnapshot?.hash ?? null;
     await loadConfig(state);
-    if (method === "config.set" && isCurrent()) {
+    if (!isCurrent()) {
+      return false;
+    }
+    // Byte proof: only a reload whose raw equals the submitted bytes is the
+    // post-write snapshot. A failed reload or a foreign writer's change must
+    // neither reconcile the pending marker nor claim a known base hash.
+    const reloadConfirmed = state.configSnapshot?.raw === raw;
+    if (reloadConfirmed) {
+      state.configDraftBaseHash = state.configFormDirty
+        ? (state.configSnapshot?.hash ?? null)
+        : state.configDraftBaseHash;
+    } else {
+      unknownBaseHashStates.add(state);
+      state.configDraftBaseHash = null;
+    }
+    if (method === "config.set") {
       const savedHash = state.configSnapshot?.hash;
-      // Reconcile the pending marker only when the reload really fetched the
-      // post-write snapshot; a failed reload would otherwise stamp the stale
-      // pre-save hash and lose the banner on the next load.
-      if (savedHash && savedHash !== preReloadHash) {
+      if (reloadConfirmed && savedHash) {
         storeNeedsApplyHash(savedHash);
       }
       state.configNeedsApply = true;
@@ -628,7 +653,7 @@ async function submitConfigChange(
       // reload; the rescheduled save reports its own completion.
       state.configAutoSaveStatus = state.configFormDirty ? "idle" : "saved";
     }
-    return isCurrent();
+    return true;
   } catch (err) {
     if (isCurrent()) {
       state.lastError = String(err);
@@ -658,6 +683,17 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
   }
   const connectionEpoch = currentConfigConnectionEpoch(state);
   const isCurrent = () => isCurrentConfigConnection(state, client, connectionEpoch);
+  if (unknownBaseHashStates.has(state)) {
+    // A previous post-save reload never confirmed, so the local snapshot hash
+    // is stale; submitting against it would manufacture a self-conflict.
+    // Re-sync first — a successful snapshot adopts the fresh hash (see
+    // applyConfigSnapshot) — and only then submit.
+    await loadConfig(state);
+    if (!isCurrent() || unknownBaseHashStates.has(state)) {
+      // Reload failed again; the next edit, flush, or reconnect retries.
+      return false;
+    }
+  }
   const submittedRaw = serializeFormForSubmit(state);
   const baseHash = state.configDraftBaseHash ?? state.configSnapshot?.hash;
   if (!baseHash) {
@@ -672,7 +708,7 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
     await client.request("config.set", { raw: submittedRaw, baseHash });
     // The write is durable even if this connection just went stale or the
     // follow-up reload fails; record the pending-apply marker first and
-    // reconcile it to the real hash after a successful reload.
+    // reconcile it to the real hash after a byte-confirmed reload.
     storeNeedsApplyHash(CONFIG_NEEDS_APPLY_PENDING);
     if (!isCurrent()) {
       return false;
@@ -683,28 +719,36 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
       state.configFormDirty = false;
       autoAllowlistedPluginIdsByState.delete(state);
     }
-    state.configDraftBaseHash = null;
-    const preReloadHash = state.configSnapshot?.hash ?? null;
+    // configDraftBaseHash stays intact until the reload below is
+    // byte-confirmed; clearing it early would fall back onto the stale
+    // snapshot hash.
     await loadConfig(state);
-    if (isCurrent()) {
+    if (!isCurrent()) {
+      return false;
+    }
+    // Byte proof: only a reload whose raw equals the submitted bytes is the
+    // post-write snapshot. A failed reload or a foreign writer's change must
+    // neither reconcile the pending marker nor claim a known base hash.
+    const reloadConfirmed = state.configSnapshot?.raw === submittedRaw;
+    if (reloadConfirmed) {
       const savedHash = state.configSnapshot?.hash;
-      // Reconcile the pending marker only when the reload really fetched the
-      // post-write snapshot; a failed reload would otherwise stamp the stale
-      // pre-save hash and lose the banner on the next load.
-      if (savedHash && savedHash !== preReloadHash) {
+      if (savedHash) {
         storeNeedsApplyHash(savedHash);
       }
-      state.configNeedsApply = true;
-      // "Saved" would lie next to a still-dirty draft (edits during the
-      // request or reload); the trailing save reports its own completion.
-      state.configAutoSaveStatus = state.configFormDirty ? "idle" : "saved";
       if (state.configFormDirty) {
         // The gateway now holds submittedRaw; rebase the surviving draft onto
         // the fresh hash so the trailing save passes the baseHash guard.
-        state.configDraftBaseHash = state.configSnapshot?.hash ?? null;
+        state.configDraftBaseHash = savedHash ?? null;
       }
+    } else {
+      unknownBaseHashStates.add(state);
+      state.configDraftBaseHash = null;
     }
-    return isCurrent();
+    state.configNeedsApply = true;
+    // "Saved" would lie next to a still-dirty draft (edits during the
+    // request or reload); the trailing save reports its own completion.
+    state.configAutoSaveStatus = state.configFormDirty ? "idle" : "saved";
+    return true;
   } catch (err) {
     if (isCurrent()) {
       state.lastError = String(err);
@@ -802,10 +846,37 @@ async function lookupConfigSchemaPath(
   }
 }
 
+function parseConfigRawDraft(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON5.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function mutateConfigForm(state: ConfigState, mutate: (draft: Record<string, unknown>) => void) {
-  const base = cloneConfigObject(
-    state.configForm ?? resolveEditableSnapshotConfig(state.configSnapshot) ?? {},
-  );
+  let base: Record<string, unknown>;
+  if (state.configFormDirty && state.configFormMode === "raw") {
+    // A dirty raw draft is authoritative. Form patches (Quick Settings shares
+    // this capability) may only apply on top of its parsed content — building
+    // on the stale parsed form would silently destroy the raw edits.
+    const parsedRawDraft = parseConfigRawDraft(state.configRaw);
+    if (!parsedRawDraft) {
+      // Unparseable raw draft: refuse the form edit and tell the user to
+      // resolve the raw buffer first; the raw draft stays authoritative.
+      state.configAutoSaveStatus = "error";
+      state.lastError = t("configView.rawDraftBlocksFormEdit");
+      return;
+    }
+    base = parsedRawDraft;
+  } else {
+    base = cloneConfigObject(
+      state.configForm ?? resolveEditableSnapshotConfig(state.configSnapshot) ?? {},
+    );
+  }
   mutate(base);
   syncConfigDraft(state, base);
 }
