@@ -420,6 +420,22 @@ describe("renderQuickSettings", () => {
     const banner = container.querySelector(".config-apply-banner");
     expect(banner?.textContent).toContain("Applying…");
     expect(banner?.querySelector("button")?.disabled).toBe(true);
+
+    // Other in-flight config writes gate the action too.
+    render(
+      renderQuickSettings(createProps({ configNeedsApply: true, configSaving: true })),
+      container,
+    );
+    expect(container.querySelector(".config-apply-banner button")?.hasAttribute("disabled")).toBe(
+      true,
+    );
+    render(
+      renderQuickSettings(createProps({ configNeedsApply: true, configAutoSaveStatus: "saving" })),
+      container,
+    );
+    expect(container.querySelector(".config-apply-banner button")?.hasAttribute("disabled")).toBe(
+      true,
+    );
   });
 
   it("locks config-backed quick controls while a config operation is pending", () => {

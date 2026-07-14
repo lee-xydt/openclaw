@@ -248,6 +248,16 @@ describe("config view", () => {
     expect(busyButton.getAttribute("aria-busy")).toBe("true");
     expect(busyButton.querySelectorAll(".config-action-spinner")).toHaveLength(1);
 
+    // Any in-flight write or pending load gates the action, not just apply.
+    for (const overrides of [
+      { saving: true },
+      { loading: true },
+      { autoSaveStatus: "saving" as const },
+    ]) {
+      const gated = renderConfigView({ needsApply: true, ...overrides });
+      expect(findButtonByText(gated.container, "Restart & apply").disabled).toBe(true);
+    }
+
     const cleared = renderConfigView({ needsApply: false });
     expect(cleared.container.querySelector(".config-apply-banner")).toBeNull();
   });

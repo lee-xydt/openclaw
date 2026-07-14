@@ -753,7 +753,7 @@ export class ConfigPage extends OpenClawLightDomElement {
       onSubsectionChange: (section) => this.setActiveSubsection(section),
       onSave: () => void runtimeConfig.save(),
       onApply: () => void runtimeConfig.apply(),
-      onRawDiscard: () => void runtimeConfig.refresh({ discardPendingChanges: true }),
+      onRawDiscard: () => void runtimeConfig.discardDraft(),
       onOpenFile: () => void runtimeConfig.openFile(),
       version:
         this.context.config.current.serverVersion ??
@@ -890,7 +890,7 @@ export class ConfigPage extends OpenClawLightDomElement {
       configAutoSaveStatus: runtimeConfig.state.configAutoSaveStatus,
       onApplyConfig: () => void runtimeConfig.apply(),
       onRetrySaveConfig: () => void runtimeConfig.save(),
-      onDiscardConfig: () => void runtimeConfig.refresh({ discardPendingChanges: true }),
+      onDiscardConfig: () => void runtimeConfig.discardDraft(),
       onThinkingChange: (level) =>
         runtimeConfig.patchForm(["agents", "defaults", "thinkingDefault"], level),
       onFastModeChange: (mode: FastMode) =>

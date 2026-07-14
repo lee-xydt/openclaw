@@ -23,10 +23,15 @@ export const CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS = 800;
  * localStorage key recording the config hash of the last successful
  * config.set that has not been applied yet. Keyed to the saved hash so the
  * restart banner survives page reloads and capability recreation, and clears
- * itself when the file changes out from under us. Known limitation: an
- * out-of-band gateway restart that leaves the file untouched keeps the banner
- * up until the next apply (a protocol follow-up tracks exposing the gateway's
- * live config generation).
+ * itself when the file changes out from under us.
+ *
+ * ACCEPTED LIMITATION (do not build versioned cross-tab protocols here): the
+ * marker is a single shared slot, so multiple tabs racing saves/applies — or
+ * out-of-band file edits, or a gateway restart that leaves the file
+ * untouched — can wrongly clear or keep it. The banner is advisory only;
+ * actual writes stay CAS-protected by the gateway's baseHash guard, so the
+ * worst case is a stale or missing restart hint. A gateway-reported
+ * appliedConfigHash (protocol follow-up) replaces this heuristic entirely.
  */
 const CONFIG_NEEDS_APPLY_STORAGE_KEY = "openclaw.config.needsApplyHash.v1";
 
@@ -128,6 +133,8 @@ export type RuntimeConfigCapability = {
   removeFormValue: (path: Array<string | number>) => void;
   setRaw: (value: string) => void;
   resetDraft: () => void;
+  /** Discards pending edits: reloads from disk when connected, else resets locally. */
+  discardDraft: () => Promise<void>;
   save: () => Promise<boolean>;
   apply: () => Promise<boolean>;
   openFile: () => Promise<void>;
@@ -661,8 +668,11 @@ async function submitConfigChange(
   } catch (err) {
     if (isCurrent()) {
       state.lastError = String(err);
-      if (method === "config.set") {
-        state.configAutoSaveStatus = isConfigBaseHashConflictError(err) ? "conflict" : "error";
+      if (isConfigBaseHashConflictError(err)) {
+        // Applies conflict the same way saves do so the UI offers Reload.
+        state.configAutoSaveStatus = "conflict";
+      } else if (method === "config.set") {
+        state.configAutoSaveStatus = "error";
       }
     }
     return false;
@@ -674,19 +684,18 @@ async function submitConfigChange(
 }
 
 /**
- * Teardown flush after an in-flight save: submits the latest draft once. The
- * epoch guards blocked the settled flight from rebasing local state, so the
- * base hash comes from the needs-apply marker that flight persisted on ack
- * (falling back to the last known base; a mismatch fails closed as a CAS
- * conflict rather than clobbering).
+ * Teardown flush after an in-flight save: submits the latest draft once,
+ * based ONLY on that flight's own in-memory ack hash. Never the shared
+ * localStorage marker — another tab may have written it, and a wrong-but-
+ * current hash there could CAS-clobber a foreign write. Callers skip the
+ * flush entirely (fail closed) when no in-memory ack hash exists.
  */
-function teardownFlushConfigDraft(state: ConfigState, client: GatewayBrowserClient): void {
+function teardownFlushConfigDraft(
+  state: ConfigState,
+  client: GatewayBrowserClient,
+  baseHash: string,
+): void {
   const raw = serializeFormForSubmit(state);
-  const baseHash =
-    readStoredNeedsApplyHash() ?? state.configDraftBaseHash ?? state.configSnapshot?.hash;
-  if (!baseHash) {
-    return;
-  }
   void client
     .request("config.set", { raw, baseHash })
     .then((ack) => {
@@ -705,7 +714,10 @@ function teardownFlushConfigDraft(state: ConfigState, client: GatewayBrowserClie
  * still matches the submitted bytes — edits made while the request was in
  * flight stay dirty so the trailing save picks them up.
  */
-async function autoSaveConfig(state: ConfigState): Promise<boolean> {
+async function autoSaveConfig(
+  state: ConfigState,
+  onAck?: (ackHash: string | null) => void,
+): Promise<boolean> {
   const client = state.client;
   if (!client || !state.connected || !state.configFormDirty || state.configFormMode !== "form") {
     return false;
@@ -728,6 +740,9 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
     // config.get derives it). Persist the restart marker directly from the
     // ack — the write is durable even if this connection just went stale.
     const ackHash = readAckHash(ack);
+    // Reported before the epoch check: dispose-chained teardown flushes need
+    // this flight's own ack even though state mutation below is blocked.
+    onAck?.(ackHash);
     if (ackHash) {
       storeNeedsApplyHash(ackHash);
     }
@@ -1131,6 +1146,8 @@ export function createRuntimeConfigCapability(
   let autoSaveInFlight: Promise<unknown> | null = null;
   let autoSaveTrailing = false;
   let lastFlightSubmittedRaw: string | null = null;
+  let lastFlightAckHash: string | null = null;
+  let manualSubmitInFlight: Promise<unknown> | null = null;
 
   const publish = () => {
     if (disposed) {
@@ -1192,9 +1209,15 @@ export function createRuntimeConfigCapability(
       return;
     }
     // Captured for teardown: dispose compares the latest draft against the
-    // in-flight submission to decide whether a final flush is needed.
+    // in-flight submission to decide whether a final flush is needed, and the
+    // flush may only CAS against this flight's own ack hash.
     lastFlightSubmittedRaw = serializeFormForSubmit(state);
-    const flight = run(() => autoSaveConfig(state))
+    lastFlightAckHash = null;
+    const flight = run(() =>
+      autoSaveConfig(state, (ackHash) => {
+        lastFlightAckHash = ackHash;
+      }),
+    )
       .catch(() => false)
       .then((saved) => {
         autoSaveInFlight = null;
@@ -1233,21 +1256,29 @@ export function createRuntimeConfigCapability(
   // write does not race it on the baseHash guard. The submit starts
   // synchronously when nothing is in flight so it binds to the current
   // connection epoch.
-  const afterAutoSaveSettled = (task: () => Promise<boolean>): Promise<boolean> => {
+  const afterPendingWritesSettled = (task: () => Promise<boolean>): Promise<boolean> => {
     cancelScheduledAutoSave();
-    const pending = autoSaveInFlight;
     return run(async () => {
-      // Drain the WHOLE autosave chain: a settling flight can spawn a
-      // trailing save (mid-flight edits/reverts), and the explicit op must
-      // run after the final ack so it submits against the freshest hash
-      // instead of racing a trailing config.set into a CAS failure.
-      let flight = pending;
+      // Drain ALL pending config writes before the explicit op: the autosave
+      // chain (a settling flight can spawn a trailing save) AND any manual
+      // Save still in flight — otherwise an apply could race a pending
+      // config.set on the same base hash into a CAS failure.
+      let flight = autoSaveInFlight ?? manualSubmitInFlight;
       while (flight) {
         await flight;
         cancelScheduledAutoSave();
-        flight = autoSaveInFlight;
+        flight = autoSaveInFlight ?? manualSubmitInFlight;
       }
-      return task();
+      const submit = task();
+      const settled = submit
+        .catch(() => false)
+        .then(() => {
+          if (manualSubmitInFlight === settled) {
+            manualSubmitInFlight = null;
+          }
+        });
+      manualSubmitInFlight = settled;
+      return await submit;
     });
   };
   const ensureLoaded = () =>
@@ -1318,8 +1349,25 @@ export function createRuntimeConfigCapability(
       cancelScheduledAutoSave();
       mutate(() => resetConfigPendingChanges(state));
     },
-    save: () => afterAutoSaveSettled(() => saveConfig(state)),
-    apply: () => afterAutoSaveSettled(() => applyConfig(state)),
+    discardDraft: () => {
+      cancelScheduledAutoSave();
+      if (state.connected && state.client) {
+        return trackLoad(
+          "config",
+          run(() => loadConfig(state, { discardPendingChanges: true })),
+        );
+      }
+      // Offline: a network refresh would silently no-op and strand the
+      // draft; fall back to a pure local reset onto the snapshot originals.
+      mutate(() => {
+        resetConfigPendingChanges(state);
+        state.configAutoSaveStatus = "idle";
+        state.lastError = null;
+      });
+      return Promise.resolve();
+    },
+    save: () => afterPendingWritesSettled(() => saveConfig(state)),
+    apply: () => afterPendingWritesSettled(() => applyConfig(state)),
     openFile: () => run(() => openConfigFile(state)),
     ensureAgentEntry: (agentId) => {
       const index = ensureAgentConfigEntry(state, agentId);
@@ -1355,9 +1403,12 @@ export function createRuntimeConfigCapability(
         void pendingFlight.then(() => {
           // The settled flight could not update dirty/base state past the
           // epoch guard; a draft whose bytes differ from that submission is a
-          // newer edit and gets exactly one final save.
-          if (state.configFormDirty && serializeFormForSubmit(state) !== flightRaw) {
-            teardownFlushConfigDraft(state, client);
+          // newer edit and gets exactly one final save. Without the flight's
+          // own ack hash there is no CAS base we can trust — skip (fail
+          // closed) rather than risk clobbering a foreign write.
+          const ackHash = lastFlightAckHash;
+          if (ackHash && state.configFormDirty && serializeFormForSubmit(state) !== flightRaw) {
+            teardownFlushConfigDraft(state, client, ackHash);
           }
         });
       } else if (canFlush && state.configFormDirty) {

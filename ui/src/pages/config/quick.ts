@@ -1066,6 +1066,10 @@ export function renderQuickSettings(props: QuickSettingsProps) {
     ${renderConfigApplyBanner({
       needsApply: props.configNeedsApply === true,
       applying: props.configApplying === true,
+      busy:
+        props.configSaving === true ||
+        props.configLoading === true ||
+        props.configAutoSaveStatus === "saving",
       connected: props.connected,
       onApply: () => props.onApplyConfig?.(),
     })}

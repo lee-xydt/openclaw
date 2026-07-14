@@ -77,7 +77,7 @@ function createConfigServerMock() {
  * createConfigServerMock variant whose FIRST config.set stays pending until
  * `firstSet` resolves — for exercising mid-flight edits/reverts/teardown.
  */
-function createDeferredSetServerMock() {
+function createDeferredSetServerMock(options: { legacyAck?: boolean } = {}) {
   const firstSet = deferred<unknown>();
   let hashCounter = 1;
   let storedRaw = '{\n  "count": 1\n}\n';
@@ -98,7 +98,7 @@ function createDeferredSetServerMock() {
       submissions.push({ raw, baseHash });
       storedRaw = raw;
       hashCounter += 1;
-      const ack = { hash: `hash-${hashCounter}` };
+      const ack = options.legacyAck ? {} : { hash: `hash-${hashCounter}` };
       return submissions.length === 1 ? firstSet.promise.then(() => ack) : Promise.resolve(ack);
     }
     if (method === "config.apply") {
@@ -1106,6 +1106,108 @@ describe("config form auto-save", () => {
     await runtimeConfig.refresh({ discardPendingChanges: true });
     expect(runtimeConfig.state.configAutoSaveStatus).toBe("idle");
     runtimeConfig.dispose();
+  });
+
+  it("drains an in-flight manual save before an explicit apply", async () => {
+    vi.useFakeTimers();
+    const { request, submissions, applySubmissions, firstSet } = createDeferredSetServerMock();
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    const rawDraft = '{\n  "count": 5\n}\n';
+    runtimeConfig.setRaw(rawDraft);
+    const savePromise = runtimeConfig.save();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(submissions).toEqual([{ raw: rawDraft, baseHash: "hash-1" }]);
+
+    // Apply while the manual save is still in flight: it must wait for the
+    // save's ack and chain onto its hash instead of racing the same base.
+    const applyPromise = runtimeConfig.apply();
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(savePromise).resolves.toBe(true);
+    await expect(applyPromise).resolves.toBe(true);
+
+    expect(applySubmissions).toEqual([{ raw: rawDraft, baseHash: "hash-2" }]);
+    runtimeConfig.dispose();
+  });
+
+  it("discards offline drafts locally instead of no-op refreshing", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig, publish } = createHarness(
+      server.request as GatewayBrowserClient["request"],
+    );
+    await runtimeConfig.ensureLoaded();
+    const originalRaw = runtimeConfig.state.configRawOriginal;
+
+    publish(false);
+    runtimeConfig.setRaw('{\n  "count": 9\n}\n');
+    expect(runtimeConfig.state.configFormDirty).toBe(true);
+
+    await runtimeConfig.discardDraft();
+    expect(runtimeConfig.state.configRaw).toBe(originalRaw);
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("idle");
+    expect(runtimeConfig.state.lastError).toBeNull();
+
+    // Connected discards still reload from disk.
+    publish(true);
+    runtimeConfig.patchForm(["count"], 4);
+    const getCallsBefore = server.request.mock.calls.filter(
+      ([method]) => method === "config.get",
+    ).length;
+    await runtimeConfig.discardDraft();
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(server.request.mock.calls.filter(([method]) => method === "config.get").length).toBe(
+      getCallsBefore + 1,
+    );
+    runtimeConfig.dispose();
+  });
+
+  it("reports a conflict status when apply hits the base-hash guard", async () => {
+    vi.useFakeTimers();
+    const request = vi.fn(async (method: string) => {
+      if (method === "config.get") {
+        return {
+          config: { count: 1 },
+          raw: '{\n  "count": 1\n}\n',
+          hash: "hash-1",
+          valid: true,
+          issues: [],
+        };
+      }
+      if (method === "config.apply") {
+        throw new Error("config changed since last load; re-run config.get and retry");
+      }
+      return {};
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    await expect(runtimeConfig.apply()).resolves.toBe(false);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("conflict");
+    runtimeConfig.dispose();
+  });
+
+  it("skips the teardown flush when the settled flight acked without a hash", async () => {
+    vi.useFakeTimers();
+    stubLocalStorage();
+    const { request, submissions, firstSet } = createDeferredSetServerMock({ legacyAck: true });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
+
+    // Without the flight's own ack hash there is no trusted CAS base for the
+    // final flush; failing closed beats clobbering a foreign write.
+    runtimeConfig.patchForm(["count"], 3);
+    runtimeConfig.dispose();
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
   });
 
   it("never auto-saves raw-text drafts and submits them on manual save", async () => {

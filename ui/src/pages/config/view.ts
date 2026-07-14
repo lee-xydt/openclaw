@@ -1341,6 +1341,8 @@ const renderBusyButtonContent = (busy: boolean, label: string, busyLabel: string
 type ConfigApplyBannerProps = {
   needsApply: boolean;
   applying: boolean;
+  /** Any config write in flight or config load pending; gates the action. */
+  busy: boolean;
   connected: boolean;
   onApply: () => void;
 };
@@ -1355,7 +1357,7 @@ export function renderConfigApplyBanner(props: ConfigApplyBannerProps) {
       <span class="config-apply-banner__text">${t("configView.applyBannerText")}</span>
       <button
         class="btn btn--sm"
-        ?disabled=${props.applying || !props.connected}
+        ?disabled=${props.busy || props.applying || !props.connected}
         aria-busy=${props.applying ? "true" : "false"}
         @click=${props.onApply}
       >
@@ -1732,6 +1734,9 @@ export function renderConfig(props: ConfigProps) {
   const applyBanner = renderConfigApplyBanner({
     needsApply: props.needsApply,
     applying: props.applying,
+    // Applying mid-save/mid-load would race the write that made the banner
+    // appear (or a stale snapshot); wait for quiet.
+    busy: props.saving || props.loading || props.autoSaveStatus === "saving",
     connected: props.connected,
     onApply: props.onApply,
   });
