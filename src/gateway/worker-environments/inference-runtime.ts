@@ -780,3 +780,4 @@ export function createWorkerInferenceExecutor(
 }
 
 export const executeWorkerInference: WorkerInferenceExecutor = createWorkerInferenceExecutor();
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

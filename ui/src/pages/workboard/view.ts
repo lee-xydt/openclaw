@@ -2369,3 +2369,4 @@ export function renderWorkboard(props: WorkboardProps) {
     </section>
   `;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

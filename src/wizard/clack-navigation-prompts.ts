@@ -822,3 +822,4 @@ export function confirmWithNavigationFooter(
     },
   }).prompt() as Promise<boolean | symbol>;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

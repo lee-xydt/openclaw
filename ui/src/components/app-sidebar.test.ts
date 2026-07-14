@@ -2959,3 +2959,4 @@ describe("AppSidebar group mutation collapsed state", () => {
     confirmSpy.mockRestore();
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

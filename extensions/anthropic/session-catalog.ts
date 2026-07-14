@@ -1333,3 +1333,4 @@ export function registerClaudeSessionCatalog(api: OpenClawPluginApi): void {
   };
   api.registerSessionCatalog(provider);
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

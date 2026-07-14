@@ -1809,3 +1809,4 @@ function mapStopReason(reason: string): StopReason {
       throw new Error(`Unhandled stop reason: ${reason}`);
   }
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

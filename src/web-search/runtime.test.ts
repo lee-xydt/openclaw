@@ -1169,3 +1169,4 @@ describe("web search runtime", () => {
     ).rejects.toThrow("web_search is enabled but no provider is currently available.");
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

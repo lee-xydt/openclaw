@@ -4029,3 +4029,4 @@ function isQmdNativeAbortAfterOutput(err: {
     stderr.includes("assertion failed")
   );
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

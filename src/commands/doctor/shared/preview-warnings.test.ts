@@ -1590,3 +1590,4 @@ describe("doctor preview warnings", () => {
     expect(warnings.join("\n")).not.toContain("personal-agent");
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

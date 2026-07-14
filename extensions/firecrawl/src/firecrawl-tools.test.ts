@@ -1358,3 +1358,4 @@ describe("firecrawl tools", () => {
     ).toThrow("Firecrawl scrape returned no content.");
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

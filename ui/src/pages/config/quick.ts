@@ -1082,3 +1082,4 @@ export function renderQuickSettings(props: QuickSettingsProps) {
     ${renderPendingChangesBar(props)} ${renderConnectionFooter(props)}
   `);
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

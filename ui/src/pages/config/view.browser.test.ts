@@ -1379,3 +1379,4 @@ describe("config view", () => {
     expect(microphoneSelect.getAttribute("aria-label")).toBe("Microphone input");
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

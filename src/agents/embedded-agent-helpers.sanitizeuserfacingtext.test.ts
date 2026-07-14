@@ -1151,3 +1151,4 @@ describe("isMessagingToolDuplicate", () => {
     expect(isMessagingToolDuplicate(input, sentTexts)).toBe(expected);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

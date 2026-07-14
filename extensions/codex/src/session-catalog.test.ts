@@ -3425,3 +3425,4 @@ describe("Codex supervision actions", () => {
     });
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

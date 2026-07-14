@@ -999,3 +999,4 @@ export class ConfigPage extends OpenClawLightDomElement {
 }
 
 customElements.define("openclaw-config-page", ConfigPage);
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

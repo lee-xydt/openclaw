@@ -1447,3 +1447,4 @@ export function toStreamingMarkdownHtml(
     : toStreamingTailHtml(streamingTail, renderOptions);
   return `${stableHtml}${tailHtml}`;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

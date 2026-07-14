@@ -1885,3 +1885,4 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
       }),
     },
   });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

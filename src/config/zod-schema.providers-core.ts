@@ -1611,3 +1611,4 @@ export const MSTeamsConfigSchema = z
     // so we cannot require them in the config object itself.
     // Runtime validation happens in resolveMSTeamsCredentials().
   });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

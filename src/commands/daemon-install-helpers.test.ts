@@ -1821,3 +1821,4 @@ describe("collectPreservedExistingServiceEnvVars — operator opt-in allowlist",
     expect(result.OPENCLAW_BAZ).toBeUndefined();
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -3482,3 +3482,4 @@ describe("message tool sandbox passthrough", () => {
     });
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
