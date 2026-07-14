@@ -611,6 +611,17 @@ function adoptConfigSetAck(state: ConfigState, submittedRaw: string, ackHash: st
   }
 }
 
+// Legacy hashless ack: the follow-up reload fetched the authoritative
+// snapshot. When it is exactly the submitted write, a preserved dirty draft
+// must rebase onto the fetched hash — its old base predates the write that
+// just succeeded, so the trailing save would false-conflict with our own
+// bytes. Foreign content keeps the old base and conflicts instead.
+function rebaseDraftAfterHashlessReload(state: ConfigState, submittedRaw: string) {
+  if (state.configFormDirty && state.configSnapshot?.raw === submittedRaw) {
+    state.configDraftBaseHash = state.configSnapshot.hash ?? state.configDraftBaseHash;
+  }
+}
+
 async function submitConfigChange(
   state: ConfigState,
   method: ConfigSubmitMethod,
@@ -634,6 +645,11 @@ async function submitConfigChange(
       state.lastError = "Config hash missing; reload and retry.";
       return false;
     }
+    // Dispatch-phase report (ackHash null): if the connection dies before the
+    // ack arrives, reconnect reconciliation still needs the submitted bytes
+    // to recognize its own committed write. The post-ack report below
+    // overwrites this with the real hash.
+    onSubmitted?.({ raw, ackHash: null });
     const ack = await client.request(method, { raw, baseHash, ...extraParams });
     // The gateway acks writes with the persisted snapshot hash (derived the
     // same way config.get derives it). Persist the restart marker directly
@@ -665,6 +681,9 @@ async function submitConfigChange(
     await loadConfig(state);
     if (!isCurrent()) {
       return false;
+    }
+    if (!ackHash) {
+      rebaseDraftAfterHashlessReload(state, raw);
     }
     if (method === "config.set") {
       state.configNeedsApply = true;
@@ -778,6 +797,7 @@ async function autoSaveConfig(
       if (!isCurrent()) {
         return false;
       }
+      rebaseDraftAfterHashlessReload(state, submittedRaw);
     }
     state.configNeedsApply = true;
     // "Saved" would lie next to a still-dirty draft (edits during the
@@ -1413,16 +1433,20 @@ export function createRuntimeConfigCapability(
               return;
             }
             // If the interrupted write DID commit, the fresh snapshot is
-            // exactly its bytes — rebase the preserved draft onto the fresh
-            // hash so the retry doesn't false-conflict against our own
-            // write. Any other server content keeps the old base and
+            // exactly its bytes: restore the saved-but-unapplied marker its
+            // lost ack would have stored, and rebase a surviving draft onto
+            // the fresh hash so the retry doesn't false-conflict against our
+            // own write. Any other server content keeps the old base and
             // conflicts instead of clobbering a foreign writer.
-            if (
-              state.configFormDirty &&
-              interruptedRaw !== null &&
-              state.configSnapshot?.raw === interruptedRaw
-            ) {
-              state.configDraftBaseHash = state.configSnapshot.hash ?? state.configDraftBaseHash;
+            if (interruptedRaw !== null && state.configSnapshot?.raw === interruptedRaw) {
+              const freshHash = state.configSnapshot.hash ?? null;
+              if (freshHash) {
+                storeNeedsApplyHash(freshHash);
+              }
+              state.configNeedsApply = true;
+              if (state.configFormDirty) {
+                state.configDraftBaseHash = freshHash ?? state.configDraftBaseHash;
+              }
             }
             publish();
             scheduleAutoSave();

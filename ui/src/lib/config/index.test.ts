@@ -1400,6 +1400,82 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
+  it("rebases trailing edits after a hashless ack so the trailing save does not self-conflict", async () => {
+    vi.useFakeTimers();
+    const { request, submissions, firstSet } = createDeferredSetServerMock({ legacyAck: true });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
+
+    // Edit while the hashless save is in flight: the follow-up reload must
+    // rebase the surviving draft onto the fetched post-write hash, or the
+    // trailing save conflicts with the write that just succeeded.
+    runtimeConfig.patchForm(["count"], 3);
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+
+    expect(submissions).toHaveLength(2);
+    expect(submissions[1]).toEqual({ raw: '{\n  "count": 3\n}\n', baseHash: "hash-2" });
+    runtimeConfig.dispose();
+  });
+
+  it("recovers a manual save whose ack was lost to a disconnect", async () => {
+    vi.useFakeTimers();
+    stubLocalStorage();
+    let committedRaw = '{\n  "count": 1\n}\n';
+    let hash = "hash-1";
+    const sets: Array<{ raw: string; baseHash: string }> = [];
+    const request = vi.fn((method: string, params?: unknown) => {
+      if (method === "config.get") {
+        return Promise.resolve({
+          config: JSON.parse(committedRaw) as Record<string, unknown>,
+          raw: committedRaw,
+          hash,
+          valid: true,
+          issues: [],
+        });
+      }
+      if (method === "config.set") {
+        sets.push(params as { raw: string; baseHash: string });
+        if (sets.length === 1) {
+          // Commits server-side, but the response never arrives.
+          committedRaw = (params as { raw: string }).raw;
+          hash = "hash-2";
+          return new Promise(() => {});
+        }
+        hash = "hash-3";
+        return Promise.resolve({ hash });
+      }
+      return Promise.resolve({});
+    });
+    const { runtimeConfig, publish } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    void runtimeConfig.save();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sets).toHaveLength(1);
+
+    publish(false);
+    publish(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The reconnect reload recognizes the committed bytes as ours even
+    // though the ack (and its manualFlightInfo hash) never arrived: the
+    // restart marker survives instead of silently disappearing.
+    expect(runtimeConfig.state.configNeedsApply).toBe(true);
+
+    // …and the still-dirty draft retries against the committed hash.
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(sets).toHaveLength(2);
+    expect(sets[1]).toEqual({ raw: '{\n  "count": 2\n}\n', baseHash: "hash-2" });
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
+    runtimeConfig.dispose();
+  });
+
   it("drains in-flight saves before a discarding refresh", async () => {
     vi.useFakeTimers();
     const { request, submissions, firstSet } = createDeferredSetServerMock();
