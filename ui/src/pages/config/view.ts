@@ -1380,7 +1380,9 @@ export function renderConfigApplyBanner(props: ConfigApplyBannerProps) {
   `;
 }
 
-function renderAutoSaveStatus(props: Pick<ConfigProps, "autoSaveStatus" | "onSave">) {
+function renderAutoSaveStatus(
+  props: Pick<ConfigProps, "autoSaveStatus" | "onSave" | "onRawDiscard">,
+) {
   switch (props.autoSaveStatus) {
     case "saving":
       return renderSettingsStatus({ kind: "accent", label: t("configView.autoSaveSaving") });
@@ -1390,6 +1392,13 @@ function renderAutoSaveStatus(props: Pick<ConfigProps, "autoSaveStatus" | "onSav
       return html`
         ${renderSettingsStatus({ kind: "danger", label: t("configView.autoSaveFailed") })}
         <button class="btn btn--sm" @click=${props.onSave}>${t("configView.retry")}</button>
+      `;
+    case "conflict":
+      // Another writer changed openclaw.json; retrying this whole-form draft
+      // would clobber their edit, so the only offered recovery is a reload.
+      return html`
+        ${renderSettingsStatus({ kind: "danger", label: t("configView.autoSaveConflict") })}
+        <button class="btn btn--sm" @click=${props.onRawDiscard}>${t("common.reload")}</button>
       `;
     default:
       return nothing;

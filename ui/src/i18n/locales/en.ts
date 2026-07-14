@@ -1280,6 +1280,7 @@ export const en: TranslationMap = {
     autoSaveSaving: "Saving…",
     autoSaveSaved: "Saved",
     autoSaveFailed: "Save failed",
+    autoSaveConflict: "Settings changed elsewhere",
     retry: "Retry",
     applyBannerText: "Saved to openclaw.json — restart the gateway to apply.",
     applyBannerAction: "Restart & apply",

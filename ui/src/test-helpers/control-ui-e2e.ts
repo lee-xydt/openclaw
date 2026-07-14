@@ -374,6 +374,38 @@ function installControlUiMockGateway(input: {
     // Storage-disabled browser contexts still get the scenario catalog.
   }
   let seq = 0;
+  // Stateful config store: config.set/config.apply persist the submitted raw
+  // and advance the hash so autosave -> reload flows round-trip edits the way
+  // the real gateway does. Active only when the scenario ships a config.get
+  // fixture with a raw string; persisted in sessionStorage like groupsState.
+  const configStateKey = "openclaw.control-ui-e2e.configState";
+  const baseConfigResponse: Record<string, unknown> | null = (() => {
+    const configured = scenario.methodResponses["config.get"];
+    return isRecord(configured) && typeof configured.raw === "string" ? configured : null;
+  })();
+  let configState: { raw: string; revision: number } | null = baseConfigResponse
+    ? { raw: baseConfigResponse.raw as string, revision: 0 }
+    : null;
+  try {
+    const rawConfigState = configState ? window.sessionStorage.getItem(configStateKey) : null;
+    if (rawConfigState) {
+      configState = JSON.parse(rawConfigState) as typeof configState;
+    }
+  } catch {
+    // Storage-disabled browser contexts still get the scenario fixture.
+  }
+
+  function persistConfigState(): void {
+    try {
+      window.sessionStorage.setItem(configStateKey, JSON.stringify(configState));
+    } catch {
+      // In-memory config still serves the current page.
+    }
+  }
+
+  function mockConfigHash(): string {
+    return `mock-config-hash-${configState?.revision ?? 0}`;
+  }
 
   function persistGroupsState(): void {
     try {
@@ -530,6 +562,30 @@ function installControlUiMockGateway(input: {
   function buildResponse(method: string, params: unknown): unknown {
     if (method === "sessions.patch") {
       recordSessionPatch(params);
+    }
+    if (configState && baseConfigResponse) {
+      if (method === "config.get") {
+        let parsedConfig: unknown = baseConfigResponse.config;
+        try {
+          parsedConfig = JSON.parse(configState.raw) as unknown;
+        } catch {
+          // JSON5-only raw keeps the last parseable config object.
+        }
+        return {
+          ...baseConfigResponse,
+          config: parsedConfig,
+          hash: mockConfigHash(),
+          raw: configState.raw,
+        };
+      }
+      if (method === "config.set" || method === "config.apply") {
+        const raw = isRecord(params) && typeof params.raw === "string" ? params.raw : null;
+        if (raw !== null) {
+          configState = { raw, revision: configState.revision + 1 };
+          persistConfigState();
+        }
+        return { ok: true };
+      }
     }
     const configured = configuredResponse(method, params);
     if (configured.found) {

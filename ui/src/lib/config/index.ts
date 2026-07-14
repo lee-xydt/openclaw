@@ -2,6 +2,7 @@
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ConfigSchemaResponse, ConfigSnapshot, ConfigUiHints } from "../../api/types.ts";
 import { schemaType, type JsonSchema } from "../../components/config-form.shared.ts";
+import { getSafeLocalStorage } from "../../local-storage.ts";
 import { copyToClipboard } from "../clipboard.ts";
 import {
   cloneConfigObject,
@@ -11,10 +12,57 @@ import {
   setPathValue,
 } from "../config-form-utils.ts";
 
-export type ConfigAutoSaveStatus = "idle" | "saving" | "saved" | "error";
+export type ConfigAutoSaveStatus = "idle" | "saving" | "saved" | "error" | "conflict";
 
 /** Debounce window between the last form edit and its automatic config.set. */
 export const CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS = 800;
+
+/**
+ * localStorage key recording the config hash of the last successful
+ * config.set that has not been applied yet. Keyed to the saved hash so the
+ * restart banner survives page reloads and capability recreation, and clears
+ * itself when the file changes out from under us. Known limitation: an
+ * out-of-band gateway restart that leaves the file untouched keeps the banner
+ * up until the next apply (a protocol follow-up tracks exposing the gateway's
+ * live config generation).
+ */
+const CONFIG_NEEDS_APPLY_STORAGE_KEY = "openclaw.config.needsApplyHash.v1";
+
+function readStoredNeedsApplyHash(): string | null {
+  try {
+    return getSafeLocalStorage()?.getItem(CONFIG_NEEDS_APPLY_STORAGE_KEY) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function storeNeedsApplyHash(hash: string | null): void {
+  try {
+    const storage = getSafeLocalStorage();
+    if (!storage) {
+      return;
+    }
+    if (hash) {
+      storage.setItem(CONFIG_NEEDS_APPLY_STORAGE_KEY, hash);
+    } else {
+      storage.removeItem(CONFIG_NEEDS_APPLY_STORAGE_KEY);
+    }
+  } catch {
+    // Storage-disabled contexts fall back to process-local banner state.
+  }
+}
+
+/**
+ * Gateway contract: requireConfigBaseHash in
+ * src/gateway/server-methods/config.ts rejects writes whose baseHash no
+ * longer matches the file with exactly this message. A conflict means another
+ * writer changed openclaw.json; retrying the whole-form draft would clobber
+ * their edit, so callers surface a reload affordance instead.
+ */
+function isConfigBaseHashConflictError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("config changed since last load");
+}
 
 type ConfigState = {
   client: GatewayBrowserClient | null;
@@ -272,10 +320,19 @@ function applyConfigSnapshot(
 ) {
   const preservePendingChanges = state.configFormDirty && options.discardPendingChanges !== true;
   if (options.discardPendingChanges === true) {
-    // Discard is a full reset to disk state: pending edits, the restart
-    // banner, and any stale save status all clear together.
-    state.configNeedsApply = false;
+    // Discard resets pending edits and stale save status, but NOT the restart
+    // banner: a saved-but-unapplied config still needs an apply even after
+    // the local draft is thrown away.
     state.configAutoSaveStatus = "idle";
+  }
+  // needsApply is persisted keyed to the saved hash (see
+  // CONFIG_NEEDS_APPLY_STORAGE_KEY); deriving it on every snapshot keeps the
+  // banner across reloads and drops it when the file changed out-of-band.
+  // Without a stored record (storage-disabled contexts) the process-local
+  // value stands.
+  const storedNeedsApplyHash = readStoredNeedsApplyHash();
+  if (storedNeedsApplyHash !== null) {
+    state.configNeedsApply = Boolean(snapshot.hash) && storedNeedsApplyHash === snapshot.hash;
   }
   const draftBaseHash = state.configDraftBaseHash ?? state.configSnapshot?.hash ?? null;
   state.configSnapshot = snapshot;
@@ -517,22 +574,27 @@ async function submitConfigChange(
     state.configFormDirty = false;
     state.configDraftBaseHash = null;
     autoAllowlistedPluginIdsByState.delete(state);
-    if (method === "config.set") {
-      // config.set writes openclaw.json without restarting; the gateway keeps
-      // running the old config until an explicit apply.
-      state.configNeedsApply = true;
-      state.configAutoSaveStatus = "saved";
-    } else {
+    if (method === "config.apply") {
+      // Applied config is now live; drop the persisted restart marker before
+      // the reload re-derives needsApply from storage.
+      storeNeedsApplyHash(null);
       state.configNeedsApply = false;
       state.configAutoSaveStatus = "idle";
     }
     await loadConfig(state);
+    if (method === "config.set" && isCurrent()) {
+      // config.set writes openclaw.json without restarting; record the saved
+      // post-reload hash so the restart banner survives page reloads.
+      storeNeedsApplyHash(state.configSnapshot?.hash ?? null);
+      state.configNeedsApply = true;
+      state.configAutoSaveStatus = "saved";
+    }
     return isCurrent();
   } catch (err) {
     if (isCurrent()) {
       state.lastError = String(err);
       if (method === "config.set") {
-        state.configAutoSaveStatus = "error";
+        state.configAutoSaveStatus = isConfigBaseHashConflictError(err) ? "conflict" : "error";
       }
     }
     return false;
@@ -578,19 +640,24 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
       autoAllowlistedPluginIdsByState.delete(state);
     }
     state.configDraftBaseHash = null;
-    state.configNeedsApply = true;
-    state.configAutoSaveStatus = "saved";
     await loadConfig(state);
-    if (isCurrent() && state.configFormDirty) {
-      // The gateway now holds submittedRaw; rebase the surviving draft onto
-      // the fresh hash so the trailing save passes the baseHash guard.
-      state.configDraftBaseHash = state.configSnapshot?.hash ?? null;
+    if (isCurrent()) {
+      // Record the saved post-reload hash so the restart banner survives page
+      // reloads (see CONFIG_NEEDS_APPLY_STORAGE_KEY).
+      storeNeedsApplyHash(state.configSnapshot?.hash ?? null);
+      state.configNeedsApply = true;
+      state.configAutoSaveStatus = "saved";
+      if (state.configFormDirty) {
+        // The gateway now holds submittedRaw; rebase the surviving draft onto
+        // the fresh hash so the trailing save passes the baseHash guard.
+        state.configDraftBaseHash = state.configSnapshot?.hash ?? null;
+      }
     }
     return isCurrent();
   } catch (err) {
     if (isCurrent()) {
       state.lastError = String(err);
-      state.configAutoSaveStatus = "error";
+      state.configAutoSaveStatus = isConfigBaseHashConflictError(err) ? "conflict" : "error";
     }
     return false;
   }
@@ -608,6 +675,17 @@ function syncConfigDraft(state: ConfigState, nextForm: Record<string, unknown>) 
   // configFormMode tracks which draft is authoritative for submission; a form
   // edit supersedes any earlier raw-text draft.
   state.configFormMode = "form";
+  resetStaleAutoSaveStatus(state);
+}
+
+/**
+ * A new dirty edit invalidates a lingering "Saved"/"Save failed" indicator;
+ * an in-flight "saving" stays visible until its request settles.
+ */
+function resetStaleAutoSaveStatus(state: ConfigState) {
+  if (state.configFormDirty && state.configAutoSaveStatus !== "saving") {
+    state.configAutoSaveStatus = "idle";
+  }
 }
 
 async function saveConfig(state: ConfigState): Promise<boolean> {
@@ -767,6 +845,7 @@ function updateConfigRawValue(state: ConfigState, value: string) {
   // serializeFormForSubmit would submit the stale form and drop raw edits.
   state.configFormMode = "raw";
   state.configFormDirty = value !== state.configRawOriginal;
+  resetStaleAutoSaveStatus(state);
   if (state.configFormDirty) {
     state.configDraftBaseHash = state.configDraftBaseHash ?? state.configSnapshot?.hash ?? null;
   } else {
@@ -1038,6 +1117,13 @@ export function createRuntimeConfigCapability(
       state.configApplying = false;
       if (state.configAutoSaveStatus === "saving") {
         state.configAutoSaveStatus = "idle";
+      }
+      // A reconnect must not strand a dirty draft whose debounce was just
+      // cancelled; reschedule against the new connection. If the file moved
+      // while offline, the save reports a baseHash conflict instead of
+      // clobbering the other writer.
+      if (state.connected && state.client) {
+        scheduleAutoSave();
       }
     }
     publish();

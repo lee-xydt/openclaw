@@ -975,10 +975,10 @@ async function createChatPickerScenario(): Promise<ControlUiMockGatewayScenario>
     historyMessages: buildScrollableChatHistory(baseTime),
     methodResponses: {
       ...buildBackgroundTasksMock(baseTime),
+      // config.set/config.apply are served statefully by the mock gateway
+      // (raw persists, hash advances) because config.get ships a raw fixture.
       "config.get": configMocks.get,
       "config.schema": configMocks.schema,
-      "config.set": { ok: true },
-      "config.apply": { ok: true },
       "sessions.diff": buildSessionDiffMock(),
       "plugins.list": buildPluginCatalogMock(),
       "channels.status": buildChannelsStatusMock(baseTime),

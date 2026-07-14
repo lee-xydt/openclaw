@@ -72,6 +72,20 @@ function createConfigServerMock() {
   return { request, submissions, currentHash: () => `hash-${hashCounter}` };
 }
 
+/** Map-backed localStorage stub; node/jsdom test envs lack a stable one. */
+function stubLocalStorage(): Map<string, string> {
+  const store = new Map<string, string>();
+  vi.stubGlobal("localStorage", {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => void store.set(key, String(value)),
+    removeItem: (key: string) => void store.delete(key),
+    clear: () => store.clear(),
+    key: () => null,
+    length: 0,
+  });
+  return store;
+}
+
 describe("createRuntimeConfigCapability", () => {
   it("preserves a dirty draft and its original base hash across refreshes", async () => {
     let getCount = 0;
@@ -416,8 +430,9 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
-  it("clears needsApply on apply and on a discarding refresh", async () => {
+  it("clears needsApply only on apply; a discarding refresh keeps the banner", async () => {
     vi.useFakeTimers();
+    const store = stubLocalStorage();
     const server = createConfigServerMock();
     const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
     await runtimeConfig.ensureLoaded();
@@ -426,15 +441,59 @@ describe("config form auto-save", () => {
     await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
     expect(runtimeConfig.state.configNeedsApply).toBe(true);
 
+    // Discarding local edits does not undo the already-saved file: the
+    // restart banner must survive until apply.
+    runtimeConfig.patchForm(["count"], 9);
+    await runtimeConfig.refresh({ discardPendingChanges: true });
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(runtimeConfig.state.configNeedsApply).toBe(true);
+
     await expect(runtimeConfig.apply()).resolves.toBe(true);
     expect(runtimeConfig.state.configNeedsApply).toBe(false);
     expect(runtimeConfig.state.configAutoSaveStatus).toBe("idle");
     expect(server.submissions.at(-1)?.method).toBe("config.apply");
+    expect(store.size).toBe(0);
+    runtimeConfig.dispose();
+  });
 
-    runtimeConfig.patchForm(["count"], 5);
+  it("persists needsApply across capability recreation keyed to the saved hash", async () => {
+    vi.useFakeTimers();
+    const store = stubLocalStorage();
+    const server = createConfigServerMock();
+    const first = createHarness(server.request as GatewayBrowserClient["request"]);
+    await first.runtimeConfig.ensureLoaded();
+
+    first.runtimeConfig.patchForm(["count"], 2);
     await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
-    expect(runtimeConfig.state.configNeedsApply).toBe(true);
-    await runtimeConfig.refresh({ discardPendingChanges: true });
+    expect(first.runtimeConfig.state.configNeedsApply).toBe(true);
+    expect([...store.values()]).toEqual([server.currentHash()]);
+    first.runtimeConfig.dispose();
+
+    // A fresh capability (page reload) re-derives the banner from storage.
+    const second = createHarness(server.request as GatewayBrowserClient["request"]);
+    await second.runtimeConfig.ensureLoaded();
+    expect(second.runtimeConfig.state.configNeedsApply).toBe(true);
+
+    await expect(second.runtimeConfig.apply()).resolves.toBe(true);
+    expect(second.runtimeConfig.state.configNeedsApply).toBe(false);
+    expect(store.size).toBe(0);
+    second.runtimeConfig.dispose();
+
+    // After apply cleared the record, a third load shows no banner.
+    const third = createHarness(server.request as GatewayBrowserClient["request"]);
+    await third.runtimeConfig.ensureLoaded();
+    expect(third.runtimeConfig.state.configNeedsApply).toBe(false);
+    third.runtimeConfig.dispose();
+  });
+
+  it("drops the persisted banner when the config hash moved out from under it", async () => {
+    vi.useFakeTimers();
+    const store = stubLocalStorage();
+    store.set("openclaw.config.needsApplyHash.v1", "hash-from-another-life");
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
     expect(runtimeConfig.state.configNeedsApply).toBe(false);
     runtimeConfig.dispose();
   });
@@ -454,6 +513,89 @@ describe("config form auto-save", () => {
     ]);
     await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 2);
     expect(server.submissions).toHaveLength(1);
+    runtimeConfig.dispose();
+  });
+
+  it("reschedules a stranded dirty draft after reconnect", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig, publish } = createHarness(
+      server.request as GatewayBrowserClient["request"],
+    );
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    publish(false);
+    // The disconnect cancelled the debounce; nothing fires while offline.
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 3);
+    expect(server.submissions).toHaveLength(0);
+    expect(runtimeConfig.state.configFormDirty).toBe(true);
+
+    publish(true);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(server.submissions).toEqual([
+      { method: "config.set", raw: '{\n  "count": 2\n}\n', baseHash: "hash-1" },
+    ]);
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(runtimeConfig.state.configNeedsApply).toBe(true);
+    runtimeConfig.dispose();
+  });
+
+  it("reports a base-hash conflict distinctly and recovers via discarding reload", async () => {
+    vi.useFakeTimers();
+    let rejectSet = true;
+    const server = createConfigServerMock();
+    const request = vi.fn(async (method: string, params?: unknown) => {
+      if (method === "config.set" && rejectSet) {
+        // Exact gateway contract message from requireConfigBaseHash
+        // (src/gateway/server-methods/config.ts).
+        throw new Error("config changed since last load; re-run config.get and retry");
+      }
+      return server.request(method, params);
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("conflict");
+    expect(runtimeConfig.state.configFormDirty).toBe(true);
+    // No auto-rebase-and-retry: the whole-form draft would clobber the other writer.
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 5);
+    expect(server.submissions).toHaveLength(0);
+
+    // The Reload affordance discards the local draft and re-syncs from disk.
+    rejectSet = false;
+    await runtimeConfig.refresh({ discardPendingChanges: true });
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("idle");
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+
+    runtimeConfig.patchForm(["count"], 3);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(server.submissions).toEqual([
+      { method: "config.set", raw: '{\n  "count": 3\n}\n', baseHash: "hash-1" },
+    ]);
+    runtimeConfig.dispose();
+  });
+
+  it("resets a stale Saved/error status as soon as a new edit lands", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
+
+    runtimeConfig.patchForm(["count"], 3);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("idle");
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
+
+    // Raw edits reset the indicator too.
+    runtimeConfig.setRaw('{\n  "count": 9\n}\n');
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("idle");
     runtimeConfig.dispose();
   });
 

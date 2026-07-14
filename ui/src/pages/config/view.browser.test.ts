@@ -220,6 +220,22 @@ describe("config view", () => {
     expect(onSave).toHaveBeenCalledTimes(1);
   });
 
+  it("offers only a reload on base-hash conflicts instead of a retry", () => {
+    const onSave = vi.fn();
+    const onRawDiscard = vi.fn();
+    const { container } = renderConfigView({ autoSaveStatus: "conflict", onSave, onRawDiscard });
+
+    const status = queryRequired(container, ".config-toolbar__status", HTMLElement);
+    expect(status.textContent).toContain("Settings changed elsewhere");
+    expect(
+      status.querySelector(".settings-status")?.classList.contains("settings-status--danger"),
+    ).toBe(true);
+    expect(findOptionalButtonByText(container, "Retry")).toBeUndefined();
+    findButtonByText(container, "Reload").click();
+    expect(onRawDiscard).toHaveBeenCalledTimes(1);
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
   it("shows the restart banner after a save and wires it to apply", () => {
     const onApply = vi.fn();
     const { container } = renderConfigView({ needsApply: true, onApply });
