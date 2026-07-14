@@ -319,14 +319,18 @@ async function prepareMatrixQaE2eeStorage(params: {
   scenarioId: string;
 }) {
   const storage = buildMatrixQaE2eeStoragePaths(params);
-  await fs.mkdir(storage.rootDir, { recursive: true });
-  await fs.mkdir(storage.accountDir, { recursive: true });
-  await fs.mkdir(path.dirname(storage.storagePath), { recursive: true });
-  await fs.writeFile(storage.idbSnapshotPath, "[]\n", { flag: "wx" }).catch((error: unknown) => {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-      throw error;
-    }
-  });
+  await fs.mkdir(storage.rootDir, { mode: 0o700, recursive: true });
+  await fs.mkdir(storage.accountDir, { mode: 0o700, recursive: true });
+  await fs.chmod(storage.rootDir, 0o700);
+  await fs.chmod(storage.accountDir, 0o700);
+  await fs
+    .writeFile(storage.idbSnapshotPath, "[]\n", { flag: "wx", mode: 0o600 })
+    .catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    });
+  await fs.chmod(storage.idbSnapshotPath, 0o600);
   return storage;
 }
 
@@ -376,7 +380,8 @@ export async function createMatrixQaE2eeScenarioClient(
   const localEvents: MatrixQaObservedEvent[] = [];
   const verificationSummaries: MatrixVerificationSummary[] = [];
   const observedEventsById = new Map<string, MatrixQaObservedEvent>();
-  let cursorIndex = 0;
+  let primeCursorIndex = 0;
+  const cursorIndexByRoom = new Map<string, number>();
 
   const recordEvent = (roomId: string, event: MatrixRawEvent) => {
     const normalized = normalizeMatrixQaObservedEvent(roomId, event);
@@ -407,13 +412,14 @@ export async function createMatrixQaE2eeScenarioClient(
   }
 
   const prime = async () => {
-    cursorIndex = Math.max(cursorIndex, localEvents.length);
-    return `e2ee:${cursorIndex}`;
+    primeCursorIndex = Math.max(primeCursorIndex, localEvents.length);
+    cursorIndexByRoom.clear();
+    return `e2ee:${primeCursorIndex}`;
   };
   const waitForOptionalRoomEvent: MatrixQaE2eeScenarioClient["waitForOptionalRoomEvent"] = async (
     waitParams,
   ) => {
-    const startSince = `e2ee:${cursorIndex}`;
+    const cursorIndex = cursorIndexByRoom.get(waitParams.roomId) ?? primeCursorIndex;
     const startedAt = Date.now();
     let scanIndex = cursorIndex;
     while (Date.now() - startedAt < waitParams.timeoutMs) {
@@ -424,20 +430,22 @@ export async function createMatrixQaE2eeScenarioClient(
         roomId: waitParams.roomId,
       });
       if (matched) {
-        cursorIndex = Math.max(cursorIndex, matched.nextCursorIndex);
+        const nextCursorIndex = Math.max(cursorIndex, matched.nextCursorIndex);
+        cursorIndexByRoom.set(waitParams.roomId, nextCursorIndex);
         return {
           event: matched.event,
           matched: true,
-          since: `e2ee:${cursorIndex}`,
+          since: `e2ee:${nextCursorIndex}`,
         };
       }
       scanIndex = localEvents.length;
       await sleep(Math.min(250, Math.max(25, waitParams.timeoutMs - (Date.now() - startedAt))));
     }
-    cursorIndex = Math.max(cursorIndex, scanIndex);
+    const nextCursorIndex = Math.max(cursorIndex, scanIndex);
+    cursorIndexByRoom.set(waitParams.roomId, nextCursorIndex);
     return {
       matched: false,
-      since: startSince,
+      since: `e2ee:${nextCursorIndex}`,
     };
   };
 
@@ -545,9 +553,9 @@ export async function createMatrixQaE2eeScenarioClient(
       return await requireCrypto().startVerification(id, method);
     },
     async stop() {
+      await client.drainPendingDecryptions().catch(() => undefined);
       client.off("room.message", recordEvent);
       client.off("verification.summary", recordVerificationSummary);
-      await client.drainPendingDecryptions().catch(() => undefined);
       await client.stopAndPersist();
     },
     waitForOptionalRoomEvent,
@@ -583,5 +591,6 @@ export const testing = {
   MATRIX_QA_E2EE_SYNC_FILTER,
   buildMatrixQaE2eeStoragePaths,
   findMatrixQaObservedEventMatch,
+  prepareMatrixQaE2eeStorage,
   shouldRecordMatrixQaObservedEventUpdate,
 };
