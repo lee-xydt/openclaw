@@ -41,11 +41,12 @@ import {
 import { t, type Locale } from "../../i18n/index.ts";
 import { formatBytes } from "../../lib/agents/display.ts";
 import { resolveAssistantTextAvatar, resolveChatAvatarRenderUrl } from "../../lib/avatar.ts";
+import type { ConfigAutoSaveStatus } from "../../lib/config/index.ts";
 import { formatDurationHuman } from "../../lib/format.ts";
 import { normalizeOptionalString } from "../../lib/string-coerce.ts";
 import { renderLanguageSelect } from "./language-select.ts";
 import { GENERAL_SETTINGS_TARGET_IDS } from "./settings-targets.ts";
-import { renderConfigApplyBanner } from "./view.ts";
+import { renderConfigApplyBanner, renderConfigAutoSaveStatus } from "./view.ts";
 
 // ── Types ──
 
@@ -128,7 +129,10 @@ type QuickSettingsProps = {
   configApplying?: boolean;
   configUpdating?: boolean;
   configNeedsApply?: boolean;
+  configAutoSaveStatus?: ConfigAutoSaveStatus;
   onApplyConfig?: () => void;
+  onRetrySaveConfig?: () => void;
+  onDiscardConfig?: () => void;
 
   // Connection
   connected: boolean;
@@ -1042,8 +1046,23 @@ function renderConnectionFooter(props: QuickSettingsProps) {
 
 // ── Main render ──
 
+function renderQuickAutoSaveStatus(props: QuickSettingsProps) {
+  const status = renderConfigAutoSaveStatus({
+    status: props.configAutoSaveStatus ?? "idle",
+    onRetry: () => props.onRetrySaveConfig?.(),
+    onReload: () => props.onDiscardConfig?.(),
+  });
+  if (status === nothing) {
+    return nothing;
+  }
+  return html`
+    <div class="config-toolbar__status" role="status" aria-live="polite">${status}</div>
+  `;
+}
+
 export function renderQuickSettings(props: QuickSettingsProps) {
   return renderSettingsPage(html`
+    ${renderQuickAutoSaveStatus(props)}
     ${renderConfigApplyBanner({
       needsApply: props.configNeedsApply === true,
       applying: props.configApplying === true,

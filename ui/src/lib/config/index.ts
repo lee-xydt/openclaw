@@ -28,6 +28,24 @@ export const CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS = 800;
  */
 const CONFIG_NEEDS_APPLY_STORAGE_KEY = "openclaw.config.needsApplyHash.v1";
 
+/**
+ * Marker written the moment a config.set is acknowledged, before the
+ * follow-up config.get reconciles it to the real saved hash. It matches any
+ * snapshot hash so a reload failure or disconnect between the write and the
+ * reload cannot lose the restart banner.
+ */
+const CONFIG_NEEDS_APPLY_PENDING = "__pending__";
+
+function storedNeedsApplyHashMatches(snapshotHash: string | null | undefined): boolean | null {
+  const stored = readStoredNeedsApplyHash();
+  if (stored === null) {
+    return null;
+  }
+  return (
+    stored === CONFIG_NEEDS_APPLY_PENDING || (Boolean(snapshotHash) && stored === snapshotHash)
+  );
+}
+
 function readStoredNeedsApplyHash(): string | null {
   try {
     return getSafeLocalStorage()?.getItem(CONFIG_NEEDS_APPLY_STORAGE_KEY) ?? null;
@@ -330,9 +348,9 @@ function applyConfigSnapshot(
   // banner across reloads and drops it when the file changed out-of-band.
   // Without a stored record (storage-disabled contexts) the process-local
   // value stands.
-  const storedNeedsApplyHash = readStoredNeedsApplyHash();
-  if (storedNeedsApplyHash !== null) {
-    state.configNeedsApply = Boolean(snapshot.hash) && storedNeedsApplyHash === snapshot.hash;
+  const storedNeedsApply = storedNeedsApplyHashMatches(snapshot.hash);
+  if (storedNeedsApply !== null) {
+    state.configNeedsApply = storedNeedsApply;
   }
   const draftBaseHash = state.configDraftBaseHash ?? state.configSnapshot?.hash ?? null;
   state.configSnapshot = snapshot;
@@ -527,6 +545,12 @@ function coerceFormValues(value: unknown, schema: JsonSchema): unknown {
  * gateway's Zod validation always sees correctly typed values.
  */
 function serializeFormForSubmit(state: ConfigState): string {
+  // A clean snapshot submits its raw bytes verbatim: reserializing the parsed
+  // form would destroy JSON5 comments/formatting the file already has (the
+  // restart banner's apply right after a raw-mode save hits exactly this).
+  if (!state.configFormDirty && typeof state.configSnapshot?.raw === "string") {
+    return state.configSnapshot.raw;
+  }
   if (state.configFormMode !== "form" || !state.configForm) {
     return state.configRaw;
   }
@@ -568,6 +592,12 @@ async function submitConfigChange(
       return false;
     }
     await client.request(method, { raw, baseHash, ...extraParams });
+    if (method === "config.set") {
+      // The write is durable even if this connection just went stale or the
+      // follow-up reload fails; record the pending-apply marker first and
+      // reconcile it to the real hash after a successful reload.
+      storeNeedsApplyHash(CONFIG_NEEDS_APPLY_PENDING);
+    }
     if (!isCurrent()) {
       return false;
     }
@@ -580,14 +610,23 @@ async function submitConfigChange(
       storeNeedsApplyHash(null);
       state.configNeedsApply = false;
       state.configAutoSaveStatus = "idle";
+    } else {
+      state.configNeedsApply = true;
     }
+    const preReloadHash = state.configSnapshot?.hash ?? null;
     await loadConfig(state);
     if (method === "config.set" && isCurrent()) {
-      // config.set writes openclaw.json without restarting; record the saved
-      // post-reload hash so the restart banner survives page reloads.
-      storeNeedsApplyHash(state.configSnapshot?.hash ?? null);
+      const savedHash = state.configSnapshot?.hash;
+      // Reconcile the pending marker only when the reload really fetched the
+      // post-write snapshot; a failed reload would otherwise stamp the stale
+      // pre-save hash and lose the banner on the next load.
+      if (savedHash && savedHash !== preReloadHash) {
+        storeNeedsApplyHash(savedHash);
+      }
       state.configNeedsApply = true;
-      state.configAutoSaveStatus = "saved";
+      // "Saved" would lie next to a draft the user re-dirtied during the
+      // reload; the rescheduled save reports its own completion.
+      state.configAutoSaveStatus = state.configFormDirty ? "idle" : "saved";
     }
     return isCurrent();
   } catch (err) {
@@ -631,22 +670,34 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
   state.chatError = null;
   try {
     await client.request("config.set", { raw: submittedRaw, baseHash });
+    // The write is durable even if this connection just went stale or the
+    // follow-up reload fails; record the pending-apply marker first and
+    // reconcile it to the real hash after a successful reload.
+    storeNeedsApplyHash(CONFIG_NEEDS_APPLY_PENDING);
     if (!isCurrent()) {
       return false;
     }
+    state.configNeedsApply = true;
     const drained = serializeFormForSubmit(state) === submittedRaw;
     if (drained) {
       state.configFormDirty = false;
       autoAllowlistedPluginIdsByState.delete(state);
     }
     state.configDraftBaseHash = null;
+    const preReloadHash = state.configSnapshot?.hash ?? null;
     await loadConfig(state);
     if (isCurrent()) {
-      // Record the saved post-reload hash so the restart banner survives page
-      // reloads (see CONFIG_NEEDS_APPLY_STORAGE_KEY).
-      storeNeedsApplyHash(state.configSnapshot?.hash ?? null);
+      const savedHash = state.configSnapshot?.hash;
+      // Reconcile the pending marker only when the reload really fetched the
+      // post-write snapshot; a failed reload would otherwise stamp the stale
+      // pre-save hash and lose the banner on the next load.
+      if (savedHash && savedHash !== preReloadHash) {
+        storeNeedsApplyHash(savedHash);
+      }
       state.configNeedsApply = true;
-      state.configAutoSaveStatus = "saved";
+      // "Saved" would lie next to a still-dirty draft (edits during the
+      // request or reload); the trailing save reports its own completion.
+      state.configAutoSaveStatus = state.configFormDirty ? "idle" : "saved";
       if (state.configFormDirty) {
         // The gateway now holds submittedRaw; rebase the surviving draft onto
         // the fresh hash so the trailing save passes the baseHash guard.
@@ -1185,7 +1236,20 @@ export function createRuntimeConfigCapability(
     },
     dispose() {
       disposed = true;
+      // SPA teardown right after an edit must not silently drop it: fire one
+      // last save before timers die. Fire-and-forget — the request leaves
+      // synchronously and the stale-epoch guards skip all state mutation once
+      // the connection is invalidated below.
+      const flushable =
+        state.configFormDirty &&
+        state.configFormMode === "form" &&
+        state.connected &&
+        state.client !== null &&
+        !autoSaveInFlight;
       cancelScheduledAutoSave();
+      if (flushable) {
+        void autoSaveConfig(state);
+      }
       invalidateConfigConnection(state);
       state.connected = false;
       state.configLoading = false;

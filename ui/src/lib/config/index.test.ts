@@ -77,7 +77,7 @@ function stubLocalStorage(): Map<string, string> {
   const store = new Map<string, string>();
   vi.stubGlobal("localStorage", {
     getItem: (key: string) => store.get(key) ?? null,
-    setItem: (key: string, value: string) => void store.set(key, String(value)),
+    setItem: (key: string, value: string) => void store.set(key, value),
     removeItem: (key: string) => void store.delete(key),
     clear: () => store.clear(),
     key: () => null,
@@ -599,16 +599,145 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
-  it("drops a scheduled auto-save on dispose", async () => {
+  it("flushes a dirty draft once on dispose instead of dropping it", async () => {
     vi.useFakeTimers();
+    const store = stubLocalStorage();
     const server = createConfigServerMock();
     const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
     await runtimeConfig.ensureLoaded();
 
     runtimeConfig.patchForm(["count"], 2);
     runtimeConfig.dispose();
+    // The teardown flush leaves synchronously; no timer needs to fire.
+    expect(server.submissions).toEqual([
+      { method: "config.set", raw: '{\n  "count": 2\n}\n', baseHash: "hash-1" },
+    ]);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 4);
+    expect(server.submissions).toHaveLength(1);
+    // The pending-apply marker survives even though the disposed capability
+    // never reconciles it to the saved hash.
+    expect([...store.values()]).toEqual(["__pending__"]);
+  });
+
+  it("does not flush clean or raw drafts on dispose", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.setRaw('{\n  "count": 5\n}\n');
+    runtimeConfig.dispose();
     await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 2);
     expect(server.submissions).toHaveLength(0);
+  });
+
+  it("applies a clean snapshot's raw bytes verbatim instead of reserializing", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    // Hand-formatted (but JSON-parseable) raw that serializeConfigForm would
+    // rewrite into pretty-printed two-space form.
+    const rawDraft = '{"count":9,"keepFormatting":true}\n';
+    runtimeConfig.setRaw(rawDraft);
+    const savePromise = runtimeConfig.save();
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(savePromise).resolves.toBe(true);
+    expect(server.submissions[0]?.raw).toBe(rawDraft);
+
+    // The banner's apply must not destroy the formatting that was just saved.
+    await expect(runtimeConfig.apply()).resolves.toBe(true);
+    expect(server.submissions[1]).toMatchObject({ method: "config.apply", raw: rawDraft });
+    runtimeConfig.dispose();
+  });
+
+  it("keeps the pending restart marker when the post-save reload fails", async () => {
+    vi.useFakeTimers();
+    const store = stubLocalStorage();
+    let failReloads = false;
+    const request = vi.fn(async (method: string) => {
+      if (method === "config.get") {
+        if (failReloads) {
+          throw new Error("gateway went away");
+        }
+        return {
+          config: { count: 1 },
+          raw: '{\n  "count": 1\n}\n',
+          hash: "hash-1",
+          valid: true,
+          issues: [],
+        };
+      }
+      return {};
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    failReloads = true;
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+
+    // The write happened; the un-reconciled marker must persist and match any
+    // hash so the banner survives a page reload after the failed refresh.
+    expect([...store.values()]).toEqual(["__pending__"]);
+    expect(runtimeConfig.state.configNeedsApply).toBe(true);
+    runtimeConfig.dispose();
+
+    failReloads = false;
+    const second = createHarness(request as GatewayBrowserClient["request"]);
+    await second.runtimeConfig.ensureLoaded();
+    expect(second.runtimeConfig.state.configNeedsApply).toBe(true);
+    second.runtimeConfig.dispose();
+  });
+
+  it("does not report Saved while edits made during the reload are still dirty", async () => {
+    vi.useFakeTimers();
+    let hashCounter = 1;
+    let storedRaw = '{\n  "count": 1\n}\n';
+    let deferReload: ReturnType<typeof deferred<unknown>> | null = null;
+    const request = vi.fn((method: string, params?: unknown) => {
+      if (method === "config.get") {
+        const response = {
+          config: JSON.parse(storedRaw) as Record<string, unknown>,
+          raw: storedRaw,
+          hash: `hash-${hashCounter}`,
+          valid: true,
+          issues: [],
+        };
+        if (deferReload) {
+          const pending = deferReload;
+          deferReload = null;
+          return pending.promise.then(() => response);
+        }
+        return Promise.resolve(response);
+      }
+      if (method === "config.set") {
+        storedRaw = (params as { raw: string }).raw;
+        hashCounter += 1;
+        return Promise.resolve({});
+      }
+      return Promise.resolve({});
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    const reloadGate = deferred<unknown>();
+    deferReload = reloadGate;
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    // config.set acked; the post-save reload is held open while a new edit lands.
+    runtimeConfig.patchForm(["count"], 3);
+    reloadGate.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(runtimeConfig.state.configFormDirty).toBe(true);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("idle");
+
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
+    runtimeConfig.dispose();
   });
 
   it("never auto-saves raw-text drafts and submits them on manual save", async () => {

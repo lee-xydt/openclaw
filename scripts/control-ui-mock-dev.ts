@@ -547,6 +547,7 @@ function buildConfigMocks() {
     messages: { queueLimit: 5, responsePrefix: "" },
     gateway: { port: 18789, bind: "127.0.0.1" },
     agents: { defaults: { thinkingDefault: "medium" } },
+    models: { mode: "merge" },
   };
   const schema = {
     type: "object",
@@ -608,6 +609,18 @@ function buildConfigMocks() {
                 enum: ["off", "low", "medium", "high"],
               },
             },
+          },
+        },
+      },
+      // Second AI section so scoped pages demo the segmented section tabs.
+      models: {
+        type: "object",
+        title: "Models",
+        properties: {
+          mode: {
+            type: "string",
+            title: "Catalog mode",
+            enum: ["merge", "replace"],
           },
         },
       },

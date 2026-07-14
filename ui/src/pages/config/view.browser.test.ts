@@ -28,14 +28,12 @@ describe("config view", () => {
     showModeToggle: true,
     formValue: {},
     originalValue: {},
-    searchQuery: "",
     activeSection: null,
     activeSubsection: null,
     onRawChange: vi.fn(),
     onFormModeChange: vi.fn(),
     onViewStateChange: vi.fn(),
     onFormPatch: vi.fn(),
-    onSearchChange: vi.fn(),
     onSectionChange: vi.fn(),
     onSave: vi.fn(),
     onApply: vi.fn(),
@@ -140,25 +138,20 @@ describe("config view", () => {
     return button;
   }
 
-  function findInteractiveByText(container: HTMLElement, text: string): HTMLElement {
-    const element = Array.from(container.querySelectorAll<HTMLElement>("button, wa-tab")).find(
-      (candidate) => candidate.textContent?.trim() === text,
+  function sectionTabLabels(container: HTMLElement): Array<string | undefined> {
+    return Array.from(container.querySelectorAll(".config-toolbar wa-radio")).map((tab) =>
+      tab.textContent?.trim(),
     );
-    if (!element) {
-      throw new Error(`Expected interactive control with text "${text}"`);
-    }
-    return element;
   }
 
   function selectConfigTab(container: HTMLElement, name: string) {
-    const group = queryRequired(container, "wa-tab-group", HTMLElement);
-    group.dispatchEvent(
-      new CustomEvent("wa-tab-show", {
-        bubbles: true,
-        composed: true,
-        detail: { name },
-      }),
-    );
+    const group = queryRequired(
+      container,
+      ".config-toolbar wa-radio-group",
+      HTMLElement,
+    ) as HTMLElement & { value: string };
+    group.value = name;
+    group.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   function queryRequired<T extends Element>(
@@ -187,6 +180,8 @@ describe("config view", () => {
     });
 
     expect(container.querySelector(".config-actions")).toBeNull();
+    expect(container.querySelector(".config-layout")).toBeNull();
+    expect(container.querySelector(".config-search__input")).toBeNull();
     for (const label of ["Reload", "Clear", "Save", "Apply", "Update"]) {
       expect(findOptionalButtonByText(container, label)).toBeUndefined();
     }
@@ -387,23 +382,23 @@ describe("config view", () => {
       container,
     );
 
-    const tabs = Array.from(container.querySelectorAll(".config-top-tabs__tab")).map((tab) =>
-      tab.textContent?.trim(),
-    );
-    expect(tabs).toEqual(["Settings", "Agents", "Gateway", "Theme"]);
-    expect(container.querySelector("wa-tab-group")?.getAttribute("activation")).toBe("manual");
+    expect(sectionTabLabels(container)).toEqual(["Settings", "Agents", "Gateway", "Theme"]);
+    // Segmented pills replaced the old tab strip and the inner panel chrome.
+    expect(container.querySelector("wa-tab-group")).toBeNull();
+    expect(container.querySelector(".config-layout")).toBeNull();
 
-    const btn = findInteractiveByText(container, "Gateway");
     selectConfigTab(container, "gateway");
     expect(onSectionChange).toHaveBeenCalledWith("gateway");
 
     onSectionChange.mockClear();
-    const settings = findInteractiveByText(container, "Settings");
-    expect(settings.hasAttribute("active")).toBe(true);
-    expect(btn.hasAttribute("active")).toBe(false);
-    expect(btn.getAttribute("aria-controls")).toBe("config-section-panel");
+    const active = container.querySelector(".config-toolbar .settings-segmented__btn--active");
+    expect(active?.textContent?.trim()).toBe("Settings");
     selectConfigTab(container, "agents");
     expect(onSectionChange).toHaveBeenCalledWith("agents");
+
+    onSectionChange.mockClear();
+    selectConfigTab(container, "root");
+    expect(onSectionChange).toHaveBeenCalledWith(null);
   });
 
   it("renders the virtual Notifications tab in Communication settings", () => {
@@ -430,10 +425,7 @@ describe("config view", () => {
       },
     });
 
-    const tabs = Array.from(container.querySelectorAll(".config-top-tabs__tab")).map((tab) =>
-      tab.textContent?.trim(),
-    );
-    expect(tabs).toContain("Notifications");
+    expect(sectionTabLabels(container)).toContain("Notifications");
 
     selectConfigTab(container, "__notifications__");
     expect(onSectionChange).toHaveBeenCalledWith("__notifications__");
@@ -570,10 +562,7 @@ describe("config view", () => {
       },
     });
 
-    const tabs = Array.from(container.querySelectorAll(".config-top-tabs__tab")).map((tab) =>
-      tab.textContent?.trim(),
-    );
-    expect(tabs).toEqual(["Channels", "Messages"]);
+    expect(sectionTabLabels(container)).toEqual(["Channels", "Messages"]);
   });
 
   it("does not normalize off-scope schema sections for scoped config tabs", () => {
@@ -615,29 +604,6 @@ describe("config view", () => {
         label.textContent?.trim(),
       ),
     ).toEqual(["Telegram"]);
-  });
-
-  it("renders and wires the search field controls", () => {
-    const container = document.createElement("div");
-    const onSearchChange = vi.fn();
-    render(
-      renderConfig({
-        ...baseProps(),
-        searchQuery: "gateway",
-        onSearchChange,
-      }),
-      container,
-    );
-
-    const icon = queryRequired(container, ".config-search__icon", SVGElement);
-    expect(icon.closest(".config-search__input-row")).toBeInstanceOf(HTMLElement);
-
-    const input = container.querySelector(".config-search__input");
-    expect(input).toBeInstanceOf(HTMLInputElement);
-    const searchInput = input as HTMLInputElement;
-    searchInput.value = "gateway";
-    searchInput.dispatchEvent(new Event("input", { bubbles: true }));
-    expect(onSearchChange).toHaveBeenCalledWith("gateway");
   });
 
   it("shows the section heading outside the group in single-section form view", () => {
@@ -708,25 +674,6 @@ describe("config view", () => {
         title.textContent?.trim(),
       ),
     ).toEqual(["Authentication", "Gateway"]);
-  });
-
-  it("clears the active search query", () => {
-    const container = document.createElement("div");
-    const onSearchChange = vi.fn();
-    render(
-      renderConfig({
-        ...baseProps(),
-        searchQuery: "gateway",
-        onSearchChange,
-      }),
-      container,
-    );
-    const clearButton = container.querySelector<HTMLButtonElement>(".config-search__clear");
-    if (!clearButton) {
-      throw new Error("Expected config search clear button");
-    }
-    clearButton.click();
-    expect(onSearchChange).toHaveBeenCalledWith("");
   });
 
   it("keeps sensitive raw config hidden until reveal before editing", () => {

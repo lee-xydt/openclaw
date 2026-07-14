@@ -253,15 +253,6 @@ export class ConfigPage extends OpenClawLightDomElement {
     infrastructure: "form",
     "ai-agents": "form",
   };
-  @state() private searchQueries: Record<ConfigPageId, string> = {
-    config: "",
-    communications: "",
-    appearance: "",
-    automation: "",
-    mcp: "",
-    infrastructure: "",
-    "ai-agents": "",
-  };
   @state() private selections: Record<ConfigPageId, ConfigSelection> = {
     config: defaultConfigSelection("config"),
     communications: defaultConfigSelection("communications"),
@@ -567,10 +558,6 @@ export class ConfigPage extends OpenClawLightDomElement {
     this.formModes = { ...this.formModes, [this.pageId]: mode };
   }
 
-  private setSearchQuery(query: string) {
-    this.searchQueries = { ...this.searchQueries, [this.pageId]: query };
-  }
-
   private setActiveSection(section: string | null) {
     this.selections = {
       ...this.selections,
@@ -756,14 +743,12 @@ export class ConfigPage extends OpenClawLightDomElement {
       showModeToggle: this.pageId === "config",
       formValue: configState.configForm,
       originalValue: configState.configFormOriginal,
-      searchQuery: this.searchQueries[this.pageId],
       activeSection,
       activeSubsection,
       onRawChange: (next) => runtimeConfig.setRaw(next),
       onFormModeChange: (mode) => this.setFormMode(mode),
       onViewStateChange: () => this.requestUpdate(),
       onFormPatch: (path, value) => runtimeConfig.patchForm(path, value),
-      onSearchChange: (query) => this.setSearchQuery(query),
       onSectionChange: (section) => this.setActiveSection(section),
       onSubsectionChange: (section) => this.setActiveSubsection(section),
       onSave: () => void runtimeConfig.save(),
@@ -886,7 +871,6 @@ export class ConfigPage extends OpenClawLightDomElement {
       onOpenCustomThemeImport: () => {
         this.pageId = "appearance";
         this.setFormMode("form");
-        this.setSearchQuery("");
         this.selections = {
           ...this.selections,
           appearance: { activeSection: "__appearance__", activeSubsection: null },
@@ -903,7 +887,10 @@ export class ConfigPage extends OpenClawLightDomElement {
       configApplying: runtimeConfig.state.configApplying,
       configUpdating: this.isUpdateBusy(),
       configNeedsApply: runtimeConfig.state.configNeedsApply,
+      configAutoSaveStatus: runtimeConfig.state.configAutoSaveStatus,
       onApplyConfig: () => void runtimeConfig.apply(),
+      onRetrySaveConfig: () => void runtimeConfig.save(),
+      onDiscardConfig: () => void runtimeConfig.refresh({ discardPendingChanges: true }),
       onThinkingChange: (level) =>
         runtimeConfig.patchForm(["agents", "defaults", "thinkingDefault"], level),
       onFastModeChange: (mode: FastMode) =>

@@ -377,6 +377,38 @@ describe("renderQuickSettings", () => {
     expect(onApplyConfig).toHaveBeenCalledTimes(1);
   });
 
+  it("surfaces the shared autosave status with its recovery actions", () => {
+    const container = document.createElement("div");
+
+    render(renderQuickSettings(createProps()), container);
+    expect(container.querySelector(".config-toolbar__status")).toBeNull();
+
+    render(renderQuickSettings(createProps({ configAutoSaveStatus: "saving" })), container);
+    expect(container.querySelector(".config-toolbar__status")?.textContent?.trim()).toBe("Saving…");
+
+    const onRetrySaveConfig = vi.fn();
+    render(
+      renderQuickSettings(createProps({ configAutoSaveStatus: "error", onRetrySaveConfig })),
+      container,
+    );
+    expect(container.querySelector(".config-toolbar__status")?.textContent).toContain(
+      "Save failed",
+    );
+    expectButtonByText(container, "Retry").click();
+    expect(onRetrySaveConfig).toHaveBeenCalledTimes(1);
+
+    const onDiscardConfig = vi.fn();
+    render(
+      renderQuickSettings(createProps({ configAutoSaveStatus: "conflict", onDiscardConfig })),
+      container,
+    );
+    expect(container.querySelector(".config-toolbar__status")?.textContent).toContain(
+      "Settings changed elsewhere",
+    );
+    expectButtonByText(container, "Reload").click();
+    expect(onDiscardConfig).toHaveBeenCalledTimes(1);
+  });
+
   it("shows a busy restart banner while applying", () => {
     const container = document.createElement("div");
 
