@@ -6331,7 +6331,7 @@ public struct ConfigSchemaLookupResult: Codable, Sendable {
     }
 }
 
-public struct CrestodianChatParams: Codable, Sendable {
+public struct SystemAgentChatParams: Codable, Sendable {
     public let sessionid: String
     public let message: String?
     public let welcomevariant: AnyCodable?
@@ -6357,7 +6357,7 @@ public struct CrestodianChatParams: Codable, Sendable {
     }
 }
 
-public struct CrestodianChatResult: Codable, Sendable {
+public struct SystemAgentChatResult: Codable, Sendable {
     public let sessionid: String
     public let reply: String
     public let sensitive: Bool?
@@ -6383,9 +6383,9 @@ public struct CrestodianChatResult: Codable, Sendable {
     }
 }
 
-public struct CrestodianSetupDetectParams: Codable, Sendable {}
+public struct SystemAgentSetupDetectParams: Codable, Sendable {}
 
-public struct CrestodianSetupDetectResult: Codable, Sendable {
+public struct SystemAgentSetupDetectResult: Codable, Sendable {
     public let candidates: [[String: AnyCodable]]
     public let manualproviders: [[String: AnyCodable]]
     public let authoptions: [[String: AnyCodable]]?
@@ -6423,9 +6423,9 @@ public struct CrestodianSetupDetectResult: Codable, Sendable {
     }
 }
 
-public struct CrestodianSetupVerifyParams: Codable, Sendable {}
+public struct SystemAgentSetupVerifyParams: Codable, Sendable {}
 
-public struct CrestodianSetupActivateParams: Codable, Sendable {
+public struct SystemAgentSetupActivateParams: Codable, Sendable {
     public let kind: AnyCodable
     public let modelref: String?
     public let authchoice: String?
@@ -6455,7 +6455,7 @@ public struct CrestodianSetupActivateParams: Codable, Sendable {
     }
 }
 
-public struct CrestodianSetupActivateResult: Codable, Sendable {
+public struct SystemAgentSetupActivateResult: Codable, Sendable {
     public let ok: Bool
     public let modelref: String?
     public let latencyms: Double?
@@ -6489,7 +6489,7 @@ public struct CrestodianSetupActivateResult: Codable, Sendable {
     }
 }
 
-public struct CrestodianSetupAuthStartParams: Codable, Sendable {
+public struct SystemAgentSetupAuthStartParams: Codable, Sendable {
     public let sessionid: String
     public let authchoice: String
     public let workspace: String?
@@ -6511,7 +6511,7 @@ public struct CrestodianSetupAuthStartParams: Codable, Sendable {
     }
 }
 
-public struct CrestodianSetupAuthStartResult: Codable, Sendable {
+public struct SystemAgentSetupAuthStartResult: Codable, Sendable {
     public let sessionid: String
     public let done: Bool
     public let step: WizardStep?

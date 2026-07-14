@@ -1068,7 +1068,7 @@ export async function startGatewayServer(
   const wizardRunner = opts.wizardRunner ?? runDefaultSetupWizard;
   const channelWizardRunner = opts.channelWizardRunner ?? runDefaultChannelSetupWizard;
   const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
-  const crestodianSessions: GatewayRequestContext["crestodianSessions"] = new Map();
+  const systemAgentSessions: GatewayRequestContext["systemAgentSessions"] = new Map();
 
   const deps = createDefaultDeps();
   let runtimeState: GatewayServerLiveState | null = null;
@@ -1906,7 +1906,7 @@ export async function startGatewayServer(
           registerToolEventRecipient: toolEventRecipients.add,
           dedupe,
           wizardSessions,
-          crestodianSessions,
+          systemAgentSessions,
           findRunningWizard,
           purgeWizardSession,
           getRuntimeSnapshot,
