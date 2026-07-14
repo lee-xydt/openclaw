@@ -355,10 +355,12 @@ export async function startMatrixQaHarness(
         ),
       );
     } catch (cleanupError) {
-      throw new AggregateError(
+      const combinedFailure = new AggregateError(
         [error, cleanupError],
         "Matrix QA harness startup and cleanup both failed",
+        { cause: cleanupError },
       );
+      throw combinedFailure;
     }
     throw error;
   }

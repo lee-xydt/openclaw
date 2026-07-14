@@ -29,9 +29,7 @@ import type { MatrixQaObservedEvent } from "./events.js";
 import type { MatrixQaRoomEventWaitResult } from "./sync.js";
 
 type MatrixQaE2eeActorId = "driver" | "observer" | `driver-${string}` | `cli-${string}`;
-
 type MatrixQaE2eeRuntime = typeof import("@openclaw/matrix/test-api.js");
-
 type MatrixQaE2eeClientParams = {
   accessToken: string;
   actorId: MatrixQaE2eeActorId;
@@ -43,25 +41,20 @@ type MatrixQaE2eeClientParams = {
   timeoutMs: number;
   userId: string;
 };
-
 const MATRIX_QA_E2EE_SYNC_FILTER = {
   room: {
     ephemeral: { not_types: ["m.receipt"] },
   },
 };
-
 type MatrixQaPluginStateValue = {
   createdAt: number;
   expiresAt?: number;
   value: unknown;
 };
-
 const matrixQaPluginStateNamespaces = new Map<string, Map<string, MatrixQaPluginStateValue>>();
-
 function resolveMatrixQaPluginStateNamespaceKey(options: OpenKeyedStoreOptions): string {
   return `${options.env?.OPENCLAW_STATE_DIR ?? ""}\0${options.namespace}`;
 }
-
 function resolveMatrixQaPluginStateRows(
   options: OpenKeyedStoreOptions,
 ): Map<string, MatrixQaPluginStateValue> {
@@ -73,7 +66,6 @@ function resolveMatrixQaPluginStateRows(
   }
   return rows;
 }
-
 function pruneMatrixQaExpiredPluginState(rows: Map<string, MatrixQaPluginStateValue>): void {
   const now = Date.now();
   for (const [key, row] of rows) {
@@ -82,7 +74,6 @@ function pruneMatrixQaExpiredPluginState(rows: Map<string, MatrixQaPluginStateVa
     }
   }
 }
-
 function enforceMatrixQaPluginStateLimit(
   rows: Map<string, MatrixQaPluginStateValue>,
   maxEntries: number,
