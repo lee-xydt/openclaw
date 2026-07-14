@@ -2210,6 +2210,9 @@ describe("package artifact reuse", () => {
       MATRIX_ALTERNATE_MODEL:
         "${{ inputs.expected_sha != '' && inputs.matrix_alternate_model || github.event_name == 'workflow_dispatch' && 'mock-openai/gpt-5.6-luna-alt' || env.OPENCLAW_CI_OPENAI_FALLBACK_MODEL }}",
     });
+    expect(workflowStep(matrixJob, "Upload Matrix QA artifacts").with?.name).toBe(
+      "${{ inputs.expected_sha != '' && format('release-qa-live-matrix-{0}', inputs.expected_sha) || format('qa-live-matrix-{0}-{1}', github.run_id, github.run_attempt) }}",
+    );
     expect(matrixJob["continue-on-error"]).toBe(
       "${{ github.event_name == 'workflow_call' && inputs.matrix_advisory }}",
     );
