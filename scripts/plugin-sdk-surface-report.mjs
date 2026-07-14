@@ -206,9 +206,10 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
     // Its flat channel-groups builder adds one function, also mirrored by compat.
     // Its case-insensitive scope-key resolver adds one function, also mirrored by compat.
     // The focused HTML entity runtime and quote-aware HTML tokenizer add one public function each.
+    // Plugin service Gateway event scope and emitter types add six mirrored type exports.
     publicExports: readPluginSdkSurfaceBudgetEnv(
       "OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_EXPORTS",
-      10684,
+      10690,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
