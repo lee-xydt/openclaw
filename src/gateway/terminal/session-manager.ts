@@ -66,7 +66,7 @@ export class TerminalSessionManager {
   private opening = 0;
 
   constructor(options: TerminalSessionManagerOptions) {
-    ensureTerminalUploadCleanup();
+    void ensureTerminalUploadCleanup();
     this.emit = options.emit;
     this.spawn = options.spawn;
     this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;

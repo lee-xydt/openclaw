@@ -1,11 +1,15 @@
 {
-  "fallbackKeys": [],
-  "generatedAt": "2026-07-14T08:44:37.623Z",
+  "fallbackKeys": [
+    "terminal.addFiles",
+    "terminal.dropFiles",
+    "terminal.uploading"
+  ],
+  "generatedAt": "2026-07-14T10:19:02.909Z",
   "locale": "zh-TW",
   "model": "gpt-5.6-sol",
   "provider": "openai",
-  "sourceHash": "0c13460dca0cb1cfcf4d17d97316218cb003189bf09681a53dd54cedebb4225b",
-  "totalKeys": 3333,
+  "sourceHash": "21c1cccb60f66155b7511568a02dd6eb13204726aa355caa15f9220c11cb4a6d",
+  "totalKeys": 3336,
   "translatedKeys": 3333,
   "workflow": 1
 }
