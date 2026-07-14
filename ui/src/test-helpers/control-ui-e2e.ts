@@ -584,7 +584,8 @@ function installControlUiMockGateway(input: {
           configState = { raw, revision: configState.revision + 1 };
           persistConfigState();
         }
-        return { ok: true };
+        // Like the real gateway, ack with the persisted snapshot hash.
+        return { ok: true, hash: mockConfigHash() };
       }
     }
     const configured = configuredResponse(method, params);

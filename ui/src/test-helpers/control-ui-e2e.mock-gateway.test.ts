@@ -57,7 +57,8 @@ describe("mock gateway stateful config", () => {
       raw: nextRaw,
       baseHash: "mock-config-hash-0",
     });
-    expect(set).toEqual({ ok: true });
+    // Acks carry the persisted hash, mirroring the real gateway contract.
+    expect(set).toEqual({ ok: true, hash: "mock-config-hash-1" });
 
     const reloaded = await request("get-2", "config.get", {});
     expect(reloaded).toMatchObject({ raw: nextRaw, hash: "mock-config-hash-1" });
@@ -67,7 +68,7 @@ describe("mock gateway stateful config", () => {
       raw: nextRaw,
       baseHash: "mock-config-hash-1",
     });
-    expect(applied).toEqual({ ok: true });
+    expect(applied).toEqual({ ok: true, hash: "mock-config-hash-2" });
     expect((await request("get-3", "config.get", {})).hash).toBe("mock-config-hash-2");
 
     socket.close();

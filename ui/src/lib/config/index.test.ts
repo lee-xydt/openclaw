@@ -65,11 +65,44 @@ function createConfigServerMock() {
       submissions.push({ method, raw, baseHash });
       storedRaw = raw;
       hashCounter += 1;
-      return {};
+      // Like the real gateway: ack with the persisted snapshot hash.
+      return { hash: `hash-${hashCounter}` };
     }
     return {};
   });
   return { request, submissions, currentHash: () => `hash-${hashCounter}` };
+}
+
+/**
+ * createConfigServerMock variant whose FIRST config.set stays pending until
+ * `firstSet` resolves — for exercising mid-flight edits/reverts/teardown.
+ */
+function createDeferredSetServerMock() {
+  const firstSet = deferred<unknown>();
+  let hashCounter = 1;
+  let storedRaw = '{\n  "count": 1\n}\n';
+  const submissions: Array<{ raw: string; baseHash: string }> = [];
+  const request = vi.fn((method: string, params?: unknown) => {
+    if (method === "config.get") {
+      return Promise.resolve({
+        config: JSON.parse(storedRaw) as Record<string, unknown>,
+        raw: storedRaw,
+        hash: `hash-${hashCounter}`,
+        valid: true,
+        issues: [],
+      });
+    }
+    if (method === "config.set") {
+      const { raw, baseHash } = params as { raw: string; baseHash: string };
+      submissions.push({ raw, baseHash });
+      storedRaw = raw;
+      hashCounter += 1;
+      const ack = { hash: `hash-${hashCounter}` };
+      return submissions.length === 1 ? firstSet.promise.then(() => ack) : Promise.resolve(ack);
+    }
+    return Promise.resolve({});
+  });
+  return { request, submissions, firstSet };
 }
 
 /** Map-backed localStorage stub; node/jsdom test envs lack a stable one. */
@@ -344,29 +377,7 @@ describe("config form auto-save", () => {
 
   it("keeps mid-flight edits dirty and queues exactly one trailing save", async () => {
     vi.useFakeTimers();
-    const firstSet = deferred<unknown>();
-    let hashCounter = 1;
-    let storedRaw = '{\n  "count": 1\n}\n';
-    const submissions: Array<{ raw: string; baseHash: string }> = [];
-    const request = vi.fn((method: string, params?: unknown) => {
-      if (method === "config.get") {
-        return Promise.resolve({
-          config: JSON.parse(storedRaw) as Record<string, unknown>,
-          raw: storedRaw,
-          hash: `hash-${hashCounter}`,
-          valid: true,
-          issues: [],
-        });
-      }
-      if (method === "config.set") {
-        const { raw, baseHash } = params as { raw: string; baseHash: string };
-        submissions.push({ raw, baseHash });
-        storedRaw = raw;
-        hashCounter += 1;
-        return submissions.length === 1 ? firstSet.promise : Promise.resolve({});
-      }
-      return Promise.resolve({});
-    });
+    const { request, submissions, firstSet } = createDeferredSetServerMock();
     const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
     await runtimeConfig.ensureLoaded();
 
@@ -495,6 +506,9 @@ describe("config form auto-save", () => {
     await runtimeConfig.ensureLoaded();
 
     expect(runtimeConfig.state.configNeedsApply).toBe(false);
+    // The mismatched record is deleted so a hash that cycles back to this
+    // value later cannot resurrect the stale banner.
+    expect(store.size).toBe(0);
     runtimeConfig.dispose();
   });
 
@@ -614,9 +628,9 @@ describe("config form auto-save", () => {
     ]);
     await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 4);
     expect(server.submissions).toHaveLength(1);
-    // The pending-apply marker survives even though the disposed capability
-    // never reconciles it to the saved hash.
-    expect([...store.values()]).toEqual(["__pending__"]);
+    // The ack hash lands in the restart marker even though the disposed
+    // capability can no longer touch its own state.
+    expect([...store.values()]).toEqual(["hash-2"]);
   });
 
   it("does not flush clean or raw drafts on dispose", async () => {
@@ -652,45 +666,6 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
-  it("keeps the pending restart marker when the post-save reload fails", async () => {
-    vi.useFakeTimers();
-    const store = stubLocalStorage();
-    let failReloads = false;
-    const request = vi.fn(async (method: string) => {
-      if (method === "config.get") {
-        if (failReloads) {
-          throw new Error("gateway went away");
-        }
-        return {
-          config: { count: 1 },
-          raw: '{\n  "count": 1\n}\n',
-          hash: "hash-1",
-          valid: true,
-          issues: [],
-        };
-      }
-      return {};
-    });
-    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
-    await runtimeConfig.ensureLoaded();
-
-    failReloads = true;
-    runtimeConfig.patchForm(["count"], 2);
-    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
-
-    // The write happened; the un-reconciled marker must persist and match any
-    // hash so the banner survives a page reload after the failed refresh.
-    expect([...store.values()]).toEqual(["__pending__"]);
-    expect(runtimeConfig.state.configNeedsApply).toBe(true);
-    runtimeConfig.dispose();
-
-    failReloads = false;
-    const second = createHarness(request as GatewayBrowserClient["request"]);
-    await second.runtimeConfig.ensureLoaded();
-    expect(second.runtimeConfig.state.configNeedsApply).toBe(true);
-    second.runtimeConfig.dispose();
-  });
-
   it("does not report Saved while edits made during the reload are still dirty", async () => {
     vi.useFakeTimers();
     let hashCounter = 1;
@@ -715,7 +690,7 @@ describe("config form auto-save", () => {
       if (method === "config.set") {
         storedRaw = (params as { raw: string }).raw;
         hashCounter += 1;
-        return Promise.resolve({});
+        return Promise.resolve({ hash: `hash-${hashCounter}` });
       }
       return Promise.resolve({});
     });
@@ -780,48 +755,53 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
-  it("keeps the pending marker when a foreign write lands between ack and reload", async () => {
+  it("persists the restart marker from the ack even when the reload fails", async () => {
     vi.useFakeTimers();
     const store = stubLocalStorage();
+    let failReloads = false;
     let hashCounter = 1;
-    let storedRaw = '{\n  "count": 1\n}\n';
-    const request = vi.fn(async (method: string, params?: unknown) => {
+    const request = vi.fn(async (method: string) => {
       if (method === "config.get") {
+        if (failReloads) {
+          throw new Error("gateway went away");
+        }
         return {
-          config: JSON.parse(storedRaw) as Record<string, unknown>,
-          raw: storedRaw,
+          config: { count: 1 },
+          raw: '{\n  "count": 1\n}\n',
           hash: `hash-${hashCounter}`,
           valid: true,
           issues: [],
         };
       }
       if (method === "config.set") {
-        storedRaw = (params as { raw: string }).raw;
         hashCounter += 1;
-        // Another writer changes the file before our reload lands.
-        storedRaw = '{\n  "count": 999\n}\n';
-        hashCounter += 1;
-        return {};
+        return { hash: `hash-${hashCounter}` };
       }
       return {};
     });
-    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
-    await runtimeConfig.ensureLoaded();
+    const first = createHarness(request as GatewayBrowserClient["request"]);
+    await first.runtimeConfig.ensureLoaded();
 
-    runtimeConfig.patchForm(["count"], 2);
+    failReloads = true;
+    first.runtimeConfig.patchForm(["count"], 2);
     await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
 
-    // The reload returned foreign bytes: never adopt its hash as "our save".
-    expect([...store.values()]).toEqual(["__pending__"]);
-    expect(runtimeConfig.state.configNeedsApply).toBe(true);
-    runtimeConfig.dispose();
+    // The ack carried the persisted hash; no reload was needed for the marker.
+    expect([...store.values()]).toEqual(["hash-2"]);
+    expect(first.runtimeConfig.state.configNeedsApply).toBe(true);
+    first.runtimeConfig.dispose();
+
+    failReloads = false;
+    const second = createHarness(request as GatewayBrowserClient["request"]);
+    await second.runtimeConfig.ensureLoaded();
+    expect(second.runtimeConfig.state.configNeedsApply).toBe(true);
+    second.runtimeConfig.dispose();
   });
 
-  it("gates autosaves behind a fresh reload after an unconfirmed post-save reload", async () => {
+  it("keeps saving against the ack hash while reloads fail", async () => {
     vi.useFakeTimers();
-    let hashCounter = 1;
-    let storedRaw = '{\n  "count": 1\n}\n';
     let failReloads = false;
+    let hashCounter = 1;
     const submissions: Array<{ raw: string; baseHash: string }> = [];
     const request = vi.fn(async (method: string, params?: unknown) => {
       if (method === "config.get") {
@@ -829,8 +809,8 @@ describe("config form auto-save", () => {
           throw new Error("gateway offline");
         }
         return {
-          config: JSON.parse(storedRaw) as Record<string, unknown>,
-          raw: storedRaw,
+          config: { count: 1 },
+          raw: '{\n  "count": 1\n}\n',
           hash: `hash-${hashCounter}`,
           valid: true,
           issues: [],
@@ -839,9 +819,8 @@ describe("config form auto-save", () => {
       if (method === "config.set") {
         const { raw, baseHash } = params as { raw: string; baseHash: string };
         submissions.push({ raw, baseHash });
-        storedRaw = raw;
         hashCounter += 1;
-        return {};
+        return { hash: `hash-${hashCounter}` };
       }
       return {};
     });
@@ -851,24 +830,78 @@ describe("config form auto-save", () => {
     failReloads = true;
     runtimeConfig.patchForm(["count"], 2);
     await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
-    expect(submissions).toEqual([{ raw: '{\n  "count": 2\n}\n', baseHash: "hash-1" }]);
-
-    // The post-save reload failed: the base hash is unknown, so further
-    // edits must not submit against the stale snapshot hash.
     runtimeConfig.patchForm(["count"], 3);
-    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 3);
-    expect(submissions).toHaveLength(1);
-    expect(runtimeConfig.state.configFormDirty).toBe(true);
-
-    // Once a reload succeeds, exactly one save goes out with the fresh hash.
-    failReloads = false;
-    runtimeConfig.patchForm(["count"], 4);
     await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
-    expect(submissions).toHaveLength(2);
-    expect(submissions[1]).toEqual({ raw: '{\n  "count": 4\n}\n', baseHash: "hash-2" });
+
+    // Each save chains onto the previous ack hash; the failed best-effort
+    // reloads never block or self-conflict the flow.
+    expect(submissions.map((entry) => entry.baseHash)).toEqual(["hash-1", "hash-2"]);
     expect(runtimeConfig.state.configFormDirty).toBe(false);
     expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
     runtimeConfig.dispose();
+  });
+
+  it("runs one trailing save when a field is reverted during the flight", async () => {
+    vi.useFakeTimers();
+    const { request, submissions, firstSet } = createDeferredSetServerMock();
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
+
+    // Revert to the pre-save value while the save is in flight: against the
+    // old original this looks clean, but the submitted bytes are now the
+    // authoritative original, so the revert must still be written back.
+    runtimeConfig.patchForm(["count"], 1);
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(submissions).toHaveLength(2);
+    expect(submissions[1]).toEqual({ raw: '{\n  "count": 1\n}\n', baseHash: "hash-2" });
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
+    runtimeConfig.dispose();
+  });
+
+  it("chains one final save when disposed mid-flight with a newer edit", async () => {
+    vi.useFakeTimers();
+    stubLocalStorage();
+    const { request, submissions, firstSet } = createDeferredSetServerMock();
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
+
+    runtimeConfig.patchForm(["count"], 3);
+    runtimeConfig.dispose();
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The newer draft lands once, based on the flight's ack hash.
+    expect(submissions).toHaveLength(2);
+    expect(submissions[1]).toEqual({ raw: '{\n  "count": 3\n}\n', baseHash: "hash-2" });
+  });
+
+  it("does not chain an extra save when disposed mid-flight without newer edits", async () => {
+    vi.useFakeTimers();
+    stubLocalStorage();
+    const { request, submissions, firstSet } = createDeferredSetServerMock();
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
+
+    runtimeConfig.dispose();
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+
+    expect(submissions).toHaveLength(1);
   });
 
   it("never auto-saves raw-text drafts and submits them on manual save", async () => {

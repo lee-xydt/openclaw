@@ -30,22 +30,10 @@ export const CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS = 800;
  */
 const CONFIG_NEEDS_APPLY_STORAGE_KEY = "openclaw.config.needsApplyHash.v1";
 
-/**
- * Marker written the moment a config.set is acknowledged, before the
- * follow-up config.get reconciles it to the real saved hash. It matches any
- * snapshot hash so a reload failure or disconnect between the write and the
- * reload cannot lose the restart banner.
- */
-const CONFIG_NEEDS_APPLY_PENDING = "__pending__";
-
-function storedNeedsApplyHashMatches(snapshotHash: string | null | undefined): boolean | null {
-  const stored = readStoredNeedsApplyHash();
-  if (stored === null) {
-    return null;
-  }
-  return (
-    stored === CONFIG_NEEDS_APPLY_PENDING || (Boolean(snapshotHash) && stored === snapshotHash)
-  );
+/** Reads the additive ack hash from a config.set/config.apply response. */
+function readAckHash(ack: unknown): string | null {
+  const hash = (ack as { hash?: unknown } | null | undefined)?.hash;
+  return typeof hash === "string" && hash.length > 0 ? hash : null;
 }
 
 function readStoredNeedsApplyHash(): string | null {
@@ -116,9 +104,6 @@ type ConfigState = {
 };
 
 const autoAllowlistedPluginIdsByState = new WeakMap<ConfigState, Set<string>>();
-// States whose draft base hash is unknown because a post-save reload never
-// confirmed; autosaves must re-sync a snapshot before submitting again.
-const unknownBaseHashStates = new WeakSet<ConfigState>();
 const requestVersionsByState = new WeakMap<ConfigState, { config: number; schema: number }>();
 const connectionEpochsByState = new WeakMap<object, number>();
 
@@ -348,23 +333,21 @@ function applyConfigSnapshot(
     // the local draft is thrown away.
     state.configAutoSaveStatus = "idle";
   }
-  // needsApply is persisted keyed to the saved hash (see
+  // needsApply is persisted keyed to the saved ack hash (see
   // CONFIG_NEEDS_APPLY_STORAGE_KEY); deriving it on every snapshot keeps the
-  // banner across reloads and drops it when the file changed out-of-band.
-  // Without a stored record (storage-disabled contexts) the process-local
-  // value stands.
-  const storedNeedsApply = storedNeedsApplyHashMatches(snapshot.hash);
-  if (storedNeedsApply !== null) {
-    state.configNeedsApply = storedNeedsApply;
+  // banner across reloads. A mismatch means the file changed out-of-band, so
+  // the record is deleted too — otherwise a hash that cycles back to the old
+  // value would resurrect a stale banner. Without a stored record
+  // (storage-disabled contexts) the process-local value stands.
+  const storedNeedsApplyHash = readStoredNeedsApplyHash();
+  if (storedNeedsApplyHash !== null) {
+    const matches = Boolean(snapshot.hash) && storedNeedsApplyHash === snapshot.hash;
+    state.configNeedsApply = matches;
+    if (!matches) {
+      storeNeedsApplyHash(null);
+    }
   }
-  // An unknown draft base (post-save reload never confirmed) adopts the
-  // fresh snapshot hash: the surviving draft was built on top of our own
-  // acknowledged write, and this snapshot is the first authoritative state
-  // seen since.
-  const draftBaseHash = unknownBaseHashStates.has(state)
-    ? (snapshot.hash ?? null)
-    : (state.configDraftBaseHash ?? state.configSnapshot?.hash ?? null);
-  unknownBaseHashStates.delete(state);
+  const draftBaseHash = state.configDraftBaseHash ?? state.configSnapshot?.hash ?? null;
   state.configSnapshot = snapshot;
   const editableConfig = resolveEditableSnapshotConfig(snapshot);
   const rawAvailable =
@@ -603,20 +586,20 @@ async function submitConfigChange(
       state.lastError = "Config hash missing; reload and retry.";
       return false;
     }
-    await client.request(method, { raw, baseHash, ...extraParams });
-    if (method === "config.set") {
-      // The write is durable even if this connection just went stale or the
-      // follow-up reload fails; record the pending-apply marker first and
-      // reconcile it to the real hash after a successful reload.
-      storeNeedsApplyHash(CONFIG_NEEDS_APPLY_PENDING);
+    const ack = await client.request(method, { raw, baseHash, ...extraParams });
+    // The gateway acks writes with the persisted snapshot hash (derived the
+    // same way config.get derives it). Persist the restart marker directly
+    // from the ack — the write is durable even if this connection just went
+    // stale — and adopt it as the new draft base.
+    const ackHash = readAckHash(ack);
+    if (method === "config.set" && ackHash) {
+      storeNeedsApplyHash(ackHash);
     }
     if (!isCurrent()) {
       return false;
     }
     state.configFormDirty = false;
-    // configDraftBaseHash stays intact until the post-write reload is
-    // byte-confirmed below; clearing it early would make the next submit fall
-    // back onto the stale snapshot hash and manufacture a self-conflict.
+    state.configDraftBaseHash = ackHash;
     autoAllowlistedPluginIdsByState.delete(state);
     if (method === "config.apply") {
       // Applied config is now live; drop the persisted restart marker before
@@ -627,27 +610,12 @@ async function submitConfigChange(
     } else {
       state.configNeedsApply = true;
     }
+    // Best-effort UI refresh; correctness no longer depends on it.
     await loadConfig(state);
     if (!isCurrent()) {
       return false;
     }
-    // Byte proof: only a reload whose raw equals the submitted bytes is the
-    // post-write snapshot. A failed reload or a foreign writer's change must
-    // neither reconcile the pending marker nor claim a known base hash.
-    const reloadConfirmed = state.configSnapshot?.raw === raw;
-    if (reloadConfirmed) {
-      state.configDraftBaseHash = state.configFormDirty
-        ? (state.configSnapshot?.hash ?? null)
-        : state.configDraftBaseHash;
-    } else {
-      unknownBaseHashStates.add(state);
-      state.configDraftBaseHash = null;
-    }
     if (method === "config.set") {
-      const savedHash = state.configSnapshot?.hash;
-      if (reloadConfirmed && savedHash) {
-        storeNeedsApplyHash(savedHash);
-      }
       state.configNeedsApply = true;
       // "Saved" would lie next to a draft the user re-dirtied during the
       // reload; the rescheduled save reports its own completion.
@@ -670,6 +638,31 @@ async function submitConfigChange(
 }
 
 /**
+ * Teardown flush after an in-flight save: submits the latest draft once. The
+ * epoch guards blocked the settled flight from rebasing local state, so the
+ * base hash comes from the needs-apply marker that flight persisted on ack
+ * (falling back to the last known base; a mismatch fails closed as a CAS
+ * conflict rather than clobbering).
+ */
+function teardownFlushConfigDraft(state: ConfigState, client: GatewayBrowserClient): void {
+  const raw = serializeFormForSubmit(state);
+  const baseHash =
+    readStoredNeedsApplyHash() ?? state.configDraftBaseHash ?? state.configSnapshot?.hash;
+  if (!baseHash) {
+    return;
+  }
+  void client
+    .request("config.set", { raw, baseHash })
+    .then((ack) => {
+      const ackHash = readAckHash(ack);
+      if (ackHash) {
+        storeNeedsApplyHash(ackHash);
+      }
+    })
+    .catch(() => undefined);
+}
+
+/**
  * Auto-save submission for debounced form edits. Unlike the manual
  * `submitConfigChange` path it never raises `configSaving` (editors must stay
  * interactive while typing) and it only clears the dirty flag when the draft
@@ -683,17 +676,6 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
   }
   const connectionEpoch = currentConfigConnectionEpoch(state);
   const isCurrent = () => isCurrentConfigConnection(state, client, connectionEpoch);
-  if (unknownBaseHashStates.has(state)) {
-    // A previous post-save reload never confirmed, so the local snapshot hash
-    // is stale; submitting against it would manufacture a self-conflict.
-    // Re-sync first — a successful snapshot adopts the fresh hash (see
-    // applyConfigSnapshot) — and only then submit.
-    await loadConfig(state);
-    if (!isCurrent() || unknownBaseHashStates.has(state)) {
-      // Reload failed again; the next edit, flush, or reconnect retries.
-      return false;
-    }
-  }
   const submittedRaw = serializeFormForSubmit(state);
   const baseHash = state.configDraftBaseHash ?? state.configSnapshot?.hash;
   if (!baseHash) {
@@ -705,44 +687,34 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
   state.lastError = null;
   state.chatError = null;
   try {
-    await client.request("config.set", { raw: submittedRaw, baseHash });
-    // The write is durable even if this connection just went stale or the
-    // follow-up reload fails; record the pending-apply marker first and
-    // reconcile it to the real hash after a byte-confirmed reload.
-    storeNeedsApplyHash(CONFIG_NEEDS_APPLY_PENDING);
+    const ack = await client.request("config.set", { raw: submittedRaw, baseHash });
+    // The gateway acks with the persisted snapshot hash (derived the same way
+    // config.get derives it). Persist the restart marker directly from the
+    // ack — the write is durable even if this connection just went stale.
+    const ackHash = readAckHash(ack);
+    if (ackHash) {
+      storeNeedsApplyHash(ackHash);
+    }
     if (!isCurrent()) {
       return false;
     }
     state.configNeedsApply = true;
+    // The submitted bytes are now the authoritative original: a draft that no
+    // longer matches them (mid-flight edits, or a revert back to the pre-save
+    // value) stays dirty so the trailing save runs.
     const drained = serializeFormForSubmit(state) === submittedRaw;
     if (drained) {
       state.configFormDirty = false;
       autoAllowlistedPluginIdsByState.delete(state);
+    } else {
+      state.configFormDirty = true;
     }
-    // configDraftBaseHash stays intact until the reload below is
-    // byte-confirmed; clearing it early would fall back onto the stale
-    // snapshot hash.
+    // The ack hash is the new draft base; the reload below is best-effort UI
+    // refresh only and correctness no longer depends on it.
+    state.configDraftBaseHash = ackHash;
     await loadConfig(state);
     if (!isCurrent()) {
       return false;
-    }
-    // Byte proof: only a reload whose raw equals the submitted bytes is the
-    // post-write snapshot. A failed reload or a foreign writer's change must
-    // neither reconcile the pending marker nor claim a known base hash.
-    const reloadConfirmed = state.configSnapshot?.raw === submittedRaw;
-    if (reloadConfirmed) {
-      const savedHash = state.configSnapshot?.hash;
-      if (savedHash) {
-        storeNeedsApplyHash(savedHash);
-      }
-      if (state.configFormDirty) {
-        // The gateway now holds submittedRaw; rebase the surviving draft onto
-        // the fresh hash so the trailing save passes the baseHash guard.
-        state.configDraftBaseHash = savedHash ?? null;
-      }
-    } else {
-      unknownBaseHashStates.add(state);
-      state.configDraftBaseHash = null;
     }
     state.configNeedsApply = true;
     // "Saved" would lie next to a still-dirty draft (edits during the
@@ -1116,6 +1088,7 @@ export function createRuntimeConfigCapability(
   let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
   let autoSaveInFlight: Promise<unknown> | null = null;
   let autoSaveTrailing = false;
+  let lastFlightSubmittedRaw: string | null = null;
 
   const publish = () => {
     if (disposed) {
@@ -1176,12 +1149,24 @@ export function createRuntimeConfigCapability(
       autoSaveTrailing = true;
       return;
     }
+    // Captured for teardown: dispose compares the latest draft against the
+    // in-flight submission to decide whether a final flush is needed.
+    lastFlightSubmittedRaw = serializeFormForSubmit(state);
     const flight = run(() => autoSaveConfig(state))
-      .catch(() => undefined)
-      .finally(() => {
+      .catch(() => false)
+      .then((saved) => {
         autoSaveInFlight = null;
-        if (autoSaveTrailing && !disposed) {
-          autoSaveTrailing = false;
+        // One trailing save catches edits (or reverts back to the pre-save
+        // value) made while the request was in flight. A still-armed debounce
+        // timer owns its own save, and failed flights never self-retry.
+        const wantsTrailing =
+          autoSaveTrailing ||
+          (saved &&
+            state.configFormDirty &&
+            state.configFormMode === "form" &&
+            autoSaveTimer === null);
+        autoSaveTrailing = false;
+        if (wantsTrailing && !disposed) {
           runAutoSave();
         }
       });
@@ -1309,16 +1294,24 @@ export function createRuntimeConfigCapability(
       disposed = true;
       // SPA teardown right after an edit must not silently drop it: fire one
       // last save before timers die. Fire-and-forget — the request leaves
-      // synchronously and the stale-epoch guards skip all state mutation once
-      // the connection is invalidated below.
-      const flushable =
-        state.configFormDirty &&
-        state.configFormMode === "form" &&
-        state.connected &&
-        state.client !== null &&
-        !autoSaveInFlight;
+      // synchronously (or chains once behind an in-flight save) and the
+      // stale-epoch guards skip all state mutation once the connection is
+      // invalidated below.
+      const client = state.client;
+      const canFlush = state.connected && client !== null && state.configFormMode === "form";
+      const pendingFlight = autoSaveInFlight;
+      const flightRaw = lastFlightSubmittedRaw;
       cancelScheduledAutoSave();
-      if (flushable) {
+      if (canFlush && pendingFlight) {
+        void pendingFlight.then(() => {
+          // The settled flight could not update dirty/base state past the
+          // epoch guard; a draft whose bytes differ from that submission is a
+          // newer edit and gets exactly one final save.
+          if (state.configFormDirty && serializeFormForSubmit(state) !== flightRaw) {
+            teardownFlushConfigDraft(state, client);
+          }
+        });
+      } else if (canFlush && state.configFormDirty) {
         void autoSaveConfig(state);
       }
       invalidateConfigConnection(state);
