@@ -86,7 +86,7 @@ describe("TerminalSessionManager", () => {
     onData?.("relay output");
     expect(emit).toHaveBeenCalledWith("conn-1", TERMINAL_EVENT_DATA, {
       sessionId: opened.sessionId,
-      seq: 0,
+      seq: "relay output".length,
       data: "relay output",
     });
     expect(manager.write("conn-1", opened.sessionId, "input")).toBe(true);
@@ -177,13 +177,31 @@ describe("TerminalSessionManager", () => {
     fake.emitData("world");
     expect(emit).toHaveBeenNthCalledWith(1, "conn-1", TERMINAL_EVENT_DATA, {
       sessionId: outcome.sessionId,
-      seq: 0,
+      seq: 5,
       data: "hello",
     });
     expect(emit).toHaveBeenNthCalledWith(2, "conn-1", TERMINAL_EVENT_DATA, {
       sessionId: outcome.sessionId,
-      seq: 1,
+      seq: 10,
       data: "world",
+    });
+  });
+
+  it("counts streamed output in UTF-16 code units", async () => {
+    const emit = vi.fn();
+    const fake = makeFakePty();
+    const manager = new TerminalSessionManager({ emit, spawn: async () => fake });
+    const outcome = await manager.open(baseRequest());
+    if (!outcome.ok) {
+      throw new Error("expected open");
+    }
+
+    fake.emitData("😀");
+
+    expect(emit).toHaveBeenCalledWith("conn-1", TERMINAL_EVENT_DATA, {
+      sessionId: outcome.sessionId,
+      seq: 2,
+      data: "😀",
     });
   });
 
@@ -506,6 +524,7 @@ describe("TerminalSessionManager detach/reattach", () => {
 
       const attached = manager.attach("conn-2", sessionId);
       expect(attached?.buffer).toBe("before away ");
+      expect(attached?.seq).toBe(12);
       expect(attached?.agentId).toBe("main");
       // The reaper is cancelled: the session survives past the grace deadline.
       vi.advanceTimersByTime(120_000);
@@ -514,7 +533,7 @@ describe("TerminalSessionManager detach/reattach", () => {
       fake.emitData("live");
       expect(emit).toHaveBeenCalledWith("conn-2", TERMINAL_EVENT_DATA, {
         sessionId,
-        seq: 1,
+        seq: 16,
         data: "live",
       });
       expect(manager.write("conn-2", sessionId, "ls\n")).toBe(true);
@@ -542,9 +561,9 @@ describe("TerminalSessionManager detach/reattach", () => {
         return { connId, sessionId: data.sessionId, seq: data.seq, data: data.data };
       });
     expect(dataEvents).toEqual([
-      { connId: "conn-1", sessionId, seq: 0, data: "first" },
-      { connId: "conn-2", sessionId, seq: 1, data: "second" },
-      { connId: "conn-3", sessionId, seq: 2, data: "third" },
+      { connId: "conn-1", sessionId, seq: 5, data: "first" },
+      { connId: "conn-2", sessionId, seq: 19, data: "second" },
+      { connId: "conn-3", sessionId, seq: 24, data: "third" },
     ]);
   });
 

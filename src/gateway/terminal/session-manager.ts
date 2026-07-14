@@ -7,6 +7,7 @@ import {
   type TerminalBackend,
 } from "./backend.js";
 import { TerminalOutputRing } from "./output-ring.js";
+import type { TerminalAttachSummary, TerminalSessionSummary } from "./session-types.js";
 
 /** Emits one terminal event frame to the single owning connection. */
 type TerminalEventSink = (connId: string, event: string, payload: unknown) => void;
@@ -31,16 +32,6 @@ type TerminalSession = {
   /** Kills the session when a detach outlives the grace period. */
   reaper: ReturnType<typeof setTimeout> | null;
   detachedAtMs: number | null;
-};
-
-/** One session's facts as reported by terminal.list. */
-type TerminalSessionSummary = {
-  sessionId: string;
-  agentId: string;
-  shell: string;
-  cwd: string;
-  attached: boolean;
-  createdAtMs: number;
 };
 
 /** Bounds concurrent shells so a client cannot exhaust host processes. */
@@ -203,12 +194,14 @@ export class TerminalSessionManager {
       }
       // Always buffer so attach can replay; stream only while a conn owns it.
       session.buffer.push(chunk);
+      session.seq += chunk.length;
       if (session.connId === null) {
         return;
       }
+      // Future output coalescers must preserve the final chunk's end offset.
       this.emit(session.connId, TERMINAL_EVENT_DATA, {
         sessionId: session.id,
-        seq: session.seq++,
+        seq: session.seq,
         data: chunk,
       });
     });
@@ -278,12 +271,7 @@ export class TerminalSessionManager {
    * in one synchronous step, so no PTY chunk can land in both the returned
    * buffer and the new owner's event stream.
    */
-  attach(
-    connId: string,
-    sessionId: string,
-  ):
-    | { sessionId: string; agentId: string; cwd: string; shell: string; buffer: string }
-    | undefined {
+  attach(connId: string, sessionId: string): TerminalAttachSummary | undefined {
     const session = this.sessions.get(sessionId);
     if (!session || session.closed) {
       return undefined;
@@ -310,6 +298,7 @@ export class TerminalSessionManager {
       cwd: session.cwd,
       shell: session.shell,
       buffer: session.buffer.snapshot(),
+      seq: session.seq,
     };
   }
 
