@@ -1,15 +1,16 @@
 {
   "fallbackKeys": [
+    "newSession.readingAttachment",
     "terminal.addFiles",
     "terminal.dropFiles",
     "terminal.uploading"
   ],
-  "generatedAt": "2026-07-14T10:19:06.611Z",
+  "generatedAt": "2026-07-14T10:26:00.949Z",
   "locale": "nl",
   "model": "gpt-5.6-sol",
   "provider": "openai",
-  "sourceHash": "21c1cccb60f66155b7511568a02dd6eb13204726aa355caa15f9220c11cb4a6d",
-  "totalKeys": 3336,
+  "sourceHash": "293eb5bd60a100e64d486a247748414edbb96d005d6ed4e1486e8a70d1d58d21",
+  "totalKeys": 3337,
   "translatedKeys": 3333,
   "workflow": 1
 }

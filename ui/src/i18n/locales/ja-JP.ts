@@ -514,6 +514,7 @@ export const ja_JP: TranslationMap = {
     worktreeNamePlaceholder: "auto",
     worktreeNameInvalid: "ワークツリー名には小文字、数字、ハイフンを使用できます。",
     messagePlaceholder: "このセッションで何に取り組みますか？",
+    readingAttachment: "Reading attachment",
     start: "セッションを開始",
     starting: "開始中…",
     createFailed: "セッションを作成できませんでした。",

@@ -503,6 +503,7 @@ export const ar: TranslationMap = {
     worktreeNamePlaceholder: "تلقائي",
     worktreeNameInvalid: "تستخدم أسماء شجرة العمل أحرفًا صغيرة وأرقامًا وشرطات.",
     messagePlaceholder: "على ماذا يجب أن تعمل هذه الجلسة؟",
+    readingAttachment: "Reading attachment",
     start: "بدء الجلسة",
     starting: "جارٍ البدء…",
     createFailed: "تعذّر إنشاء الجلسة.",
