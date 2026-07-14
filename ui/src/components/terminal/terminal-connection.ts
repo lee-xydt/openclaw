@@ -40,6 +40,8 @@ type TerminalSessionInfo = {
   createdAtMs: number;
 };
 
+export type TerminalUploadResult = { path: string; size: number };
+
 type TerminalExitInfo = {
   exitCode: number | null;
   signal: number | null;
@@ -220,6 +222,16 @@ export class TerminalConnection {
 
   async resize(sessionId: string, cols: number, rows: number): Promise<void> {
     await this.client.request("terminal.resize", { sessionId, cols, rows }).catch(() => undefined);
+  }
+
+  async upload(
+    sessionId: string,
+    file: { name: string; contentBase64: string },
+  ): Promise<TerminalUploadResult> {
+    return await this.client.request<TerminalUploadResult>("terminal.upload", {
+      sessionId,
+      ...file,
+    });
   }
 
   /** Closes a session server-side and drops its local sink. */
