@@ -1210,6 +1210,48 @@ describe("config form auto-save", () => {
     expect(submissions).toHaveLength(1);
   });
 
+  it("drains in-flight saves before a discard without trailing the discarded bytes", async () => {
+    vi.useFakeTimers();
+    const { request, submissions, firstSet } = createDeferredSetServerMock();
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
+
+    // A mid-flight edit would normally spawn a trailing save; a discard must
+    // wait for the flight and then throw the draft away instead.
+    runtimeConfig.patchForm(["count"], 3);
+    const discardPromise = runtimeConfig.discardDraft();
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+    await discardPromise;
+
+    expect(submissions).toHaveLength(1);
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    // The draft ends clean against the acked/reloaded state, not the old bytes.
+    expect(runtimeConfig.state.configForm).toEqual({ count: 2 });
+    runtimeConfig.dispose();
+  });
+
+  it("refuses apply while a raw draft is dirty", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.setRaw('{\n  "count": 9\n}\n');
+    await expect(runtimeConfig.apply()).resolves.toBe(false);
+
+    // Raw stays explicit-save-only: nothing was written, the user is told to
+    // resolve the raw draft first.
+    expect(server.submissions).toHaveLength(0);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("error");
+    expect(runtimeConfig.state.lastError).toContain("Raw editor");
+    runtimeConfig.dispose();
+  });
+
   it("never auto-saves raw-text drafts and submits them on manual save", async () => {
     vi.useFakeTimers();
     const server = createConfigServerMock();

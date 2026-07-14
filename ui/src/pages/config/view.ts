@@ -1735,8 +1735,9 @@ export function renderConfig(props: ConfigProps) {
     needsApply: props.needsApply,
     applying: props.applying,
     // Applying mid-save/mid-load would race the write that made the banner
-    // appear (or a stale snapshot); wait for quiet.
-    busy: props.saving || props.loading || props.autoSaveStatus === "saving",
+    // appear (or a stale snapshot); a dirty raw draft blocks apply outright
+    // (raw is explicit-save-only). Wait for quiet.
+    busy: props.saving || props.loading || props.autoSaveStatus === "saving" || hasRawChanges,
     connected: props.connected,
     onApply: props.onApply,
   });

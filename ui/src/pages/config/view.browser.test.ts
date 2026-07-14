@@ -248,11 +248,12 @@ describe("config view", () => {
     expect(busyButton.getAttribute("aria-busy")).toBe("true");
     expect(busyButton.querySelectorAll(".config-action-spinner")).toHaveLength(1);
 
-    // Any in-flight write or pending load gates the action, not just apply.
+    // Any in-flight write, pending load, or dirty raw draft gates the action.
     for (const overrides of [
       { saving: true },
       { loading: true },
       { autoSaveStatus: "saving" as const },
+      { formMode: "raw" as const, raw: '{\n  "a": 1\n}\n', originalRaw: "{\n}\n" },
     ]) {
       const gated = renderConfigView({ needsApply: true, ...overrides });
       expect(findButtonByText(gated.container, "Restart & apply").disabled).toBe(true);

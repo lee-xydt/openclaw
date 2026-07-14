@@ -892,6 +892,9 @@ function mutateConfigForm(state: ConfigState, mutate: (draft: Record<string, unk
     // A dirty raw draft is authoritative. Form patches (Quick Settings shares
     // this capability) may only apply on top of its parsed content — building
     // on the stale parsed form would silently destroy the raw edits.
+    // Contract: merging onto the parsed raw draft is intentional — content is
+    // preserved, but the unsaved raw draft's formatting/comments are not once
+    // form editing resumes.
     const parsedRawDraft = parseConfigRawDraft(state.configRaw);
     if (!parsedRawDraft) {
       // Unparseable raw draft: refuse the form edit and tell the user to
@@ -1148,6 +1151,9 @@ export function createRuntimeConfigCapability(
   let lastFlightSubmittedRaw: string | null = null;
   let lastFlightAckHash: string | null = null;
   let manualSubmitInFlight: Promise<unknown> | null = null;
+  // Blocks trailing autosaves while a discard drains pending writes; the
+  // drained draft is about to be thrown away, not re-written.
+  let suppressAutoSave = false;
 
   const publish = () => {
     if (disposed) {
@@ -1199,7 +1205,7 @@ export function createRuntimeConfigCapability(
     autoSaveTrailing = false;
   };
   const runAutoSave = () => {
-    if (disposed) {
+    if (disposed || suppressAutoSave) {
       return;
     }
     if (autoSaveInFlight) {
@@ -1256,18 +1262,25 @@ export function createRuntimeConfigCapability(
   // write does not race it on the baseHash guard. The submit starts
   // synchronously when nothing is in flight so it binds to the current
   // connection epoch.
+  // Drains ALL pending config writes: the autosave chain (a settling flight
+  // can spawn a trailing save) AND any manual Save still in flight.
+  const drainPendingWrites = async (): Promise<void> => {
+    let flight = autoSaveInFlight ?? manualSubmitInFlight;
+    while (flight) {
+      await flight;
+      cancelScheduledAutoSave();
+      flight = autoSaveInFlight ?? manualSubmitInFlight;
+    }
+  };
   const afterPendingWritesSettled = (task: () => Promise<boolean>): Promise<boolean> => {
     cancelScheduledAutoSave();
     return run(async () => {
-      // Drain ALL pending config writes before the explicit op: the autosave
-      // chain (a settling flight can spawn a trailing save) AND any manual
-      // Save still in flight — otherwise an apply could race a pending
-      // config.set on the same base hash into a CAS failure.
-      let flight = autoSaveInFlight ?? manualSubmitInFlight;
-      while (flight) {
-        await flight;
-        cancelScheduledAutoSave();
-        flight = autoSaveInFlight ?? manualSubmitInFlight;
+      // Drain before the explicit op — otherwise an apply could race a
+      // pending config.set on the same base hash into a CAS failure. The
+      // idle-path guard keeps the op starting synchronously so it binds to
+      // the current connection epoch.
+      if (autoSaveInFlight ?? manualSubmitInFlight) {
+        await drainPendingWrites();
       }
       const submit = task();
       const settled = submit
@@ -1349,8 +1362,19 @@ export function createRuntimeConfigCapability(
       cancelScheduledAutoSave();
       mutate(() => resetConfigPendingChanges(state));
     },
-    discardDraft: () => {
+    discardDraft: async () => {
+      // Settle pending writes first (with trailing saves suppressed — the
+      // draft is being thrown away, not re-written) so a late ack cannot
+      // re-dirty or trail-write over the discard.
       cancelScheduledAutoSave();
+      if (autoSaveInFlight ?? manualSubmitInFlight) {
+        suppressAutoSave = true;
+        try {
+          await drainPendingWrites();
+        } finally {
+          suppressAutoSave = false;
+        }
+      }
       if (state.connected && state.client) {
         return trackLoad(
           "config",
@@ -1364,10 +1388,21 @@ export function createRuntimeConfigCapability(
         state.configAutoSaveStatus = "idle";
         state.lastError = null;
       });
-      return Promise.resolve();
     },
     save: () => afterPendingWritesSettled(() => saveConfig(state)),
-    apply: () => afterPendingWritesSettled(() => applyConfig(state)),
+    apply: () =>
+      afterPendingWritesSettled(async () => {
+        // Checked after the drain: a raw draft whose explicit Save is in
+        // flight resolves clean and may apply. A raw draft that is STILL
+        // dirty here was never reviewed-saved — applying would implicitly
+        // write unreviewed raw text, so refuse and point at the Raw editor.
+        if (state.configFormDirty && state.configFormMode === "raw") {
+          state.configAutoSaveStatus = "error";
+          state.lastError = t("configView.rawDraftBlocksApply");
+          return false;
+        }
+        return applyConfig(state);
+      }),
     openFile: () => run(() => openConfigFile(state)),
     ensureAgentEntry: (agentId) => {
       const index = ensureAgentConfigEntry(state, agentId);
