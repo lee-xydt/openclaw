@@ -564,6 +564,42 @@ function serializeFormForSubmit(state: ConfigState): string {
 type ConfigSubmitMethod = "config.set" | "config.apply";
 type ConfigSubmitBusyKey = "configSaving" | "configApplying";
 
+/**
+ * Adopts a successful write ack as the authoritative local snapshot BEFORE
+ * any reload: the submitted bytes are on disk under the acked hash, so the
+ * raw/hash/originals must never keep describing the pre-save file (a failed
+ * best-effort reload would otherwise leave stale-bytes paths alive — e.g.
+ * apply re-submitting the old raw, or a revert-during-reload comparing
+ * clean). Server-resolved values (secret redaction) still refresh via the
+ * follow-up reload, which is purely cosmetic from here on.
+ */
+function adoptConfigSetAck(state: ConfigState, submittedRaw: string, ackHash: string | null) {
+  const parsed = parseConfigRawDraft(submittedRaw);
+  state.configSnapshot = {
+    ...state.configSnapshot,
+    raw: submittedRaw,
+    hash: ackHash ?? state.configSnapshot?.hash ?? null,
+    valid: true,
+    issues: [],
+    ...(parsed ? { config: parsed, sourceConfig: parsed } : {}),
+  };
+  state.configValid = true;
+  state.configIssues = [];
+  state.configRawOriginal = submittedRaw;
+  if (parsed) {
+    state.configFormOriginal = cloneConfigObject(parsed);
+  }
+  state.configDraftBaseHash = ackHash;
+  if (!state.configFormDirty) {
+    // Clean drafts snap to the persisted bytes, mirroring what a reload's
+    // non-preserving snapshot application would do.
+    state.configRaw = submittedRaw;
+    if (parsed) {
+      state.configForm = cloneConfigObject(parsed);
+    }
+  }
+}
+
 async function submitConfigChange(
   state: ConfigState,
   method: ConfigSubmitMethod,
@@ -599,8 +635,8 @@ async function submitConfigChange(
       return false;
     }
     state.configFormDirty = false;
-    state.configDraftBaseHash = ackHash;
     autoAllowlistedPluginIdsByState.delete(state);
+    adoptConfigSetAck(state, raw, ackHash);
     if (method === "config.apply") {
       // Applied config is now live; drop the persisted restart marker before
       // the reload re-derives needsApply from storage.
@@ -701,7 +737,8 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
     state.configNeedsApply = true;
     // The submitted bytes are now the authoritative original: a draft that no
     // longer matches them (mid-flight edits, or a revert back to the pre-save
-    // value) stays dirty so the trailing save runs.
+    // value) stays dirty so the trailing save runs. Computed before adoption
+    // so the comparison sees the pre-save snapshot for reverted-clean drafts.
     const drained = serializeFormForSubmit(state) === submittedRaw;
     if (drained) {
       state.configFormDirty = false;
@@ -709,9 +746,7 @@ async function autoSaveConfig(state: ConfigState): Promise<boolean> {
     } else {
       state.configFormDirty = true;
     }
-    // The ack hash is the new draft base; the reload below is best-effort UI
-    // refresh only and correctness no longer depends on it.
-    state.configDraftBaseHash = ackHash;
+    adoptConfigSetAck(state, submittedRaw, ackHash);
     await loadConfig(state);
     if (!isCurrent()) {
       return false;
@@ -746,13 +781,20 @@ function syncConfigDraft(state: ConfigState, nextForm: Record<string, unknown>) 
 }
 
 /**
- * A new dirty edit invalidates a lingering "Saved"/"Save failed" indicator;
- * an in-flight "saving" stays visible until its request settles.
+ * Any mutation invalidates a lingering "Saved"/"Save failed" indicator: a
+ * dirty edit is about to reschedule, and a clean revert makes the old
+ * failure moot (its error is cleared too). Two states persist regardless:
+ * "saving" reports the in-flight request, and "conflict" marks the snapshot
+ * itself stale — only a reload clears it, no local edit can.
  */
 function resetStaleAutoSaveStatus(state: ConfigState) {
-  if (state.configFormDirty && state.configAutoSaveStatus !== "saving") {
-    state.configAutoSaveStatus = "idle";
+  if (state.configAutoSaveStatus === "saving" || state.configAutoSaveStatus === "conflict") {
+    return;
   }
+  if (!state.configFormDirty && state.configAutoSaveStatus === "error") {
+    state.lastError = null;
+  }
+  state.configAutoSaveStatus = "idle";
 }
 
 async function saveConfig(state: ConfigState): Promise<boolean> {
@@ -1195,8 +1237,15 @@ export function createRuntimeConfigCapability(
     cancelScheduledAutoSave();
     const pending = autoSaveInFlight;
     return run(async () => {
-      if (pending) {
-        await pending;
+      // Drain the WHOLE autosave chain: a settling flight can spawn a
+      // trailing save (mid-flight edits/reverts), and the explicit op must
+      // run after the final ack so it submits against the freshest hash
+      // instead of racing a trailing config.set into a CAS failure.
+      let flight = pending;
+      while (flight) {
+        await flight;
+        cancelScheduledAutoSave();
+        flight = autoSaveInFlight;
       }
       return task();
     });
