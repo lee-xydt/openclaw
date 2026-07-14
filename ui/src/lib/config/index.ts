@@ -1266,6 +1266,12 @@ export function createRuntimeConfigCapability(
     if (disposed || writesSuspended || !state.configFormDirty || state.configFormMode !== "form") {
       return;
     }
+    // A conflict proves the snapshot is stale; retrying against the same base
+    // hash would fail again and mask the reload warning with "Saving…". Only
+    // a discard/reload (which installs a fresh snapshot) re-enables autosave.
+    if (state.configAutoSaveStatus === "conflict") {
+      return;
+    }
     if (autoSaveTimer) {
       clearTimeout(autoSaveTimer);
     }
@@ -1301,6 +1307,11 @@ export function createRuntimeConfigCapability(
       // the current connection epoch.
       if (autoSaveInFlight ?? manualSubmitInFlight) {
         await drainPendingWrites();
+      }
+      // The updater may have started while we drained; suspension must be a
+      // real barrier or an apply could restart the gateway mid-update.
+      if (writesSuspended || disposed) {
+        return false;
       }
       manualFlightInfo = null;
       const submit = task();
