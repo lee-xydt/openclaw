@@ -292,7 +292,9 @@ export function bootstrapApplication(): ApplicationRuntime {
   const sessions = createSessionCapability(gateway);
   const workboard = createWorkboardCapability();
   const runtimeConfig = createRuntimeConfigCapability(gateway);
-  const overlays = createApplicationOverlays(gateway);
+  const overlays = createApplicationOverlays(gateway, {
+    drainConfigWrites: () => runtimeConfig.waitForPendingWrites(),
+  });
   // App-updater interlock: writing config (or restarting the gateway) while
   // the updater runs can corrupt the install; pause config writes until the
   // update settles. Wired app-lifetime so page unmounts cannot strand it.

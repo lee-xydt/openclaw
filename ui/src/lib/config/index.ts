@@ -137,6 +137,8 @@ export type RuntimeConfigCapability = {
   discardDraft: () => Promise<void>;
   /** Pauses/resumes all config writes (autosave + manual) while e.g. the app updater runs. */
   setWritesSuspended: (suspended: boolean) => void;
+  /** Resolves once no config write is in flight (used as an updater barrier). */
+  waitForPendingWrites: () => Promise<void>;
   save: () => Promise<boolean>;
   apply: () => Promise<boolean>;
   openFile: () => Promise<void>;
@@ -1431,11 +1433,14 @@ export function createRuntimeConfigCapability(
         return;
       }
       writesSuspended = suspended;
-      if (!suspended) {
+      if (suspended) {
+        cancelScheduledAutoSave();
+      } else {
         // Edits made during the update save once it ends.
         scheduleAutoSave();
       }
     },
+    waitForPendingWrites: () => drainPendingWrites(),
     save: () =>
       afterPendingWritesSettled(() =>
         saveConfig(state, (info) => {
