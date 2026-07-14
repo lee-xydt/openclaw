@@ -1325,6 +1325,139 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
+  it("flushes a pre-ack revert during disposal", async () => {
+    vi.useFakeTimers();
+    const { request, submissions, firstSet } = createDeferredSetServerMock();
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
+
+    // Revert to the original value while the save is in flight: dirty reads
+    // false (originals not yet rebased onto the submission), but the bytes
+    // differ from the submitted ones — dropping this flush would persist the
+    // unreverted value.
+    runtimeConfig.patchForm(["count"], 1);
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    runtimeConfig.dispose();
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(submissions).toHaveLength(2);
+    expect(submissions[1]).toEqual({ raw: '{\n  "count": 1\n}\n', baseHash: "hash-2" });
+  });
+
+  it("reconciles an uncertain in-flight save after reconnect before autosave resumes", async () => {
+    vi.useFakeTimers();
+    let committedRaw = '{\n  "count": 1\n}\n';
+    let hash = "hash-1";
+    const sets: Array<{ raw: string; baseHash: string }> = [];
+    const request = vi.fn((method: string, params?: unknown) => {
+      if (method === "config.get") {
+        return Promise.resolve({
+          config: JSON.parse(committedRaw) as Record<string, unknown>,
+          raw: committedRaw,
+          hash,
+          valid: true,
+          issues: [],
+        });
+      }
+      if (method === "config.set") {
+        sets.push(params as { raw: string; baseHash: string });
+        if (sets.length === 1) {
+          // The server commits the first save, but the connection dies
+          // before the acknowledgement arrives.
+          committedRaw = (params as { raw: string }).raw;
+          hash = "hash-2";
+          return new Promise(() => {});
+        }
+        hash = "hash-3";
+        return Promise.resolve({ hash });
+      }
+      return Promise.resolve({});
+    });
+    const { runtimeConfig, publish } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(sets).toHaveLength(1);
+
+    // Edit again mid-flight, then drop the connection before the ack lands.
+    runtimeConfig.patchForm(["count"], 3);
+    publish(false);
+    publish(true);
+    // Reconnect fetches the authoritative snapshot; the fresh bytes match the
+    // interrupted submission, so the surviving draft is rebased onto the
+    // committed hash instead of false-conflicting against our own write.
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+
+    expect(sets).toHaveLength(2);
+    expect(sets[1]).toEqual({ raw: '{\n  "count": 3\n}\n', baseHash: "hash-2" });
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
+    runtimeConfig.dispose();
+  });
+
+  it("drains in-flight saves before a discarding refresh", async () => {
+    vi.useFakeTimers();
+    const { request, submissions, firstSet } = createDeferredSetServerMock();
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(submissions).toHaveLength(1);
+
+    // Same barrier as discardDraft: the settling flight must not trail the
+    // just-discarded edit back to disk after the refresh.
+    runtimeConfig.patchForm(["count"], 3);
+    const refreshPromise = runtimeConfig.refresh({ discardPendingChanges: true });
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+    await refreshPromise;
+
+    expect(submissions).toHaveLength(1);
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(runtimeConfig.state.configForm).toEqual({ count: 2 });
+    runtimeConfig.dispose();
+  });
+
+  it("flushes a scheduled form autosave before config.patch and re-arms after", async () => {
+    vi.useFakeTimers();
+    const order: string[] = [];
+    let hashCounter = 1;
+    const request = vi.fn((method: string) => {
+      if (method === "config.get") {
+        return Promise.resolve({
+          config: { count: 1 },
+          raw: '{\n  "count": 1\n}\n',
+          hash: `hash-${hashCounter}`,
+          valid: true,
+          issues: [],
+        });
+      }
+      if (method === "config.set" || method === "config.patch") {
+        order.push(method);
+        hashCounter += 1;
+        return Promise.resolve({ hash: `hash-${hashCounter}` });
+      }
+      return Promise.resolve({});
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    // Patch during the debounce window: the draft must be flushed as a real
+    // save before the patch, not silently dropped with its timer.
+    runtimeConfig.patchForm(["count"], 2);
+    await expect(runtimeConfig.patch({ raw: { other: true } })).resolves.toBe(true);
+
+    expect(order).toEqual(["config.set", "config.patch"]);
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    runtimeConfig.dispose();
+  });
+
   it("adopts the acked autosave without a follow-up reload", async () => {
     vi.useFakeTimers();
     const server = createConfigServerMock();

@@ -1167,6 +1167,11 @@ export function createRuntimeConfigCapability(
   let lastFlightSubmittedRaw: string | null = null;
   let lastFlightAckHash: string | null = null;
   let manualSubmitInFlight: Promise<unknown> | null = null;
+  // A write interrupted by a connection change may or may not have committed;
+  // remembered across the disconnect so the reconnect can reconcile against a
+  // fresh snapshot before autosave resumes.
+  let hasInterruptedWrite = false;
+  let interruptedWriteRaw: string | null = null;
   // Blocks trailing autosaves while a discard drains pending writes; the
   // drained draft is about to be thrown away, not re-written.
   let suppressAutoSave = false;
@@ -1249,6 +1254,11 @@ export function createRuntimeConfigCapability(
     )
       .catch(() => false)
       .then((saved) => {
+        // A connection change deregisters flights; a stale completion must
+        // not clear a NEW flight's registration or steal its trailing state.
+        if (autoSaveInFlight !== flight) {
+          return;
+        }
         autoSaveInFlight = null;
         // One trailing save catches edits (or reverts back to the pre-save
         // value) made while the request was in flight. A still-armed debounce
@@ -1302,6 +1312,20 @@ export function createRuntimeConfigCapability(
       flight = autoSaveInFlight ?? manualSubmitInFlight;
     }
   };
+  // Discard barrier shared by discardDraft and refresh({discardPendingChanges}):
+  // settle pending writes with trailing saves suppressed so a late completion
+  // cannot trail the just-discarded bytes back to disk.
+  const drainWritesForDiscard = async (): Promise<void> => {
+    cancelScheduledAutoSave();
+    if (autoSaveInFlight ?? manualSubmitInFlight) {
+      suppressAutoSave = true;
+      try {
+        await drainPendingWrites();
+      } finally {
+        suppressAutoSave = false;
+      }
+    }
+  };
   const afterPendingWritesSettled = (task: () => Promise<boolean>): Promise<boolean> => {
     if (writesSuspended) {
       return Promise.resolve(false);
@@ -1350,6 +1374,18 @@ export function createRuntimeConfigCapability(
       // from the previous connection cannot commit into the new connection epoch.
       invalidateConfigConnection(state);
       cancelScheduledAutoSave();
+      if (autoSaveInFlight !== null || manualSubmitInFlight !== null) {
+        // The epoch guard already blocks these flights from mutating state;
+        // leaving them registered would wedge drain barriers and the
+        // trailing-save chain on a request that may never settle. Remember
+        // the uncertain submission for reconnect reconciliation instead.
+        hasInterruptedWrite = true;
+        interruptedWriteRaw =
+          autoSaveInFlight !== null ? lastFlightSubmittedRaw : (manualFlightInfo?.raw ?? null);
+        autoSaveInFlight = null;
+        manualSubmitInFlight = null;
+        autoSaveTrailing = false;
+      }
       state.configLoading = false;
       state.configSchemaLoading = false;
       state.configSaving = false;
@@ -1362,7 +1398,38 @@ export function createRuntimeConfigCapability(
       // while offline, the save reports a baseHash conflict instead of
       // clobbering the other writer.
       if (state.connected && state.client) {
-        scheduleAutoSave();
+        if (hasInterruptedWrite) {
+          // The interrupted write may or may not have committed. Fetch the
+          // authoritative snapshot before autosave resumes so an uncertain
+          // flight can't strand a clean-looking draft or retry a stale base.
+          const interruptedRaw = interruptedWriteRaw;
+          hasInterruptedWrite = false;
+          interruptedWriteRaw = null;
+          void trackLoad(
+            "config",
+            run(() => loadConfig(state)),
+          ).then(() => {
+            if (disposed || !state.connected) {
+              return;
+            }
+            // If the interrupted write DID commit, the fresh snapshot is
+            // exactly its bytes — rebase the preserved draft onto the fresh
+            // hash so the retry doesn't false-conflict against our own
+            // write. Any other server content keeps the old base and
+            // conflicts instead of clobbering a foreign writer.
+            if (
+              state.configFormDirty &&
+              interruptedRaw !== null &&
+              state.configSnapshot?.raw === interruptedRaw
+            ) {
+              state.configDraftBaseHash = state.configSnapshot.hash ?? state.configDraftBaseHash;
+            }
+            publish();
+            scheduleAutoSave();
+          });
+        } else {
+          scheduleAutoSave();
+        }
       }
     }
     publish();
@@ -1374,9 +1441,9 @@ export function createRuntimeConfigCapability(
     },
     ensureLoaded,
     ensureSchemaLoaded,
-    refresh: (options) => {
+    refresh: async (options) => {
       if (options?.discardPendingChanges) {
-        cancelScheduledAutoSave();
+        await drainWritesForDiscard();
       }
       return trackLoad(
         "config",
@@ -1405,15 +1472,7 @@ export function createRuntimeConfigCapability(
       // Settle pending writes first (with trailing saves suppressed — the
       // draft is being thrown away, not re-written) so a late ack cannot
       // re-dirty or trail-write over the discard.
-      cancelScheduledAutoSave();
-      if (autoSaveInFlight ?? manualSubmitInFlight) {
-        suppressAutoSave = true;
-        try {
-          await drainPendingWrites();
-        } finally {
-          suppressAutoSave = false;
-        }
-      }
+      await drainWritesForDiscard();
       if (state.connected && state.client) {
         return trackLoad(
           "config",
@@ -1480,7 +1539,18 @@ export function createRuntimeConfigCapability(
     },
     // Patches are config writes too: they must honor updater suspension and
     // register as a drainable flight, or a patch could overlap update.run.
-    patch: (options) => afterPendingWritesSettled(() => patchConfig(state, options)),
+    // Unlike save/apply, a patch does not submit the form draft — flush a
+    // scheduled autosave into a flight first (the settle below drains it) and
+    // re-arm the debounce after so a dirty form is never left timer-less.
+    patch: (options) => {
+      if (autoSaveTimer) {
+        cancelScheduledAutoSave();
+        runAutoSave();
+      }
+      return afterPendingWritesSettled(() => patchConfig(state, options)).finally(() => {
+        scheduleAutoSave();
+      });
+    },
     lookupSchemaPath: (path) => run(() => lookupConfigSchemaPath(state, path)),
     subscribe(listener) {
       listeners.add(listener);
@@ -1514,12 +1584,11 @@ export function createRuntimeConfigCapability(
             : manualFlightInfo;
           const ackHash = submitted?.ackHash ?? null;
           const submittedRaw = submitted?.raw ?? null;
-          if (
-            ackHash &&
-            submittedRaw !== null &&
-            state.configFormDirty &&
-            serializeFormForSubmit(state) !== submittedRaw
-          ) {
+          // Bytes-vs-submission is the only trustworthy signal here: the
+          // epoch guard blocked the ack's rebase, so a revert back to the
+          // pre-save value reads configFormDirty=false while the persisted
+          // bytes are still the unreverted submission.
+          if (ackHash && submittedRaw !== null && serializeFormForSubmit(state) !== submittedRaw) {
             teardownFlushConfigDraft(state, client, ackHash);
           }
         });
