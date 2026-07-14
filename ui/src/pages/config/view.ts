@@ -123,6 +123,8 @@ export type ConfigProps = {
   schemaLoading: boolean;
   uiHints: ConfigUiHints;
   formMode: ConfigFormMode;
+  /** Capability-authoritative unsaved raw draft, independent of the display toggle. */
+  rawDraftPending?: boolean;
   viewState: ConfigViewState;
   rawAvailable?: boolean;
   showModeToggle?: boolean;
@@ -1465,7 +1467,12 @@ export function renderConfig(props: ConfigProps) {
   );
   const formUnsafe = analysis.schema ? analysis.unsupportedPaths.length > 0 : false;
   const rawAvailable = props.rawAvailable ?? true;
-  const formMode = showModeToggle && rawAvailable ? props.formMode : "form";
+  // An unsaved raw draft stays authoritative in the capability; hiding the
+  // raw editor would show a stale form beside an apply that always refuses.
+  // Pin the raw view until the draft is saved or discarded.
+  const rawDraftPending = Boolean(props.rawDraftPending) && rawAvailable;
+  const displayFormMode = showModeToggle && rawAvailable ? props.formMode : "form";
+  const formMode = rawDraftPending ? "raw" : displayFormMode;
   const requestUpdate = props.onViewStateChange;
   // Scroll helper: target-based (nav clicks) with global fallback (form/raw toggle)
   const resetContentScroll = (target: EventTarget | null) => {
@@ -1765,8 +1772,12 @@ export function renderConfig(props: ConfigProps) {
                     <div class="config-mode-toggle">
                       <button
                         class="config-mode-toggle__btn ${formMode === "form" ? "active" : ""}"
-                        ?disabled=${props.schemaLoading || !props.schema}
-                        title=${formUnsafe ? t("configView.formUnsafeTitle") : ""}
+                        ?disabled=${props.schemaLoading || !props.schema || rawDraftPending}
+                        title=${rawDraftPending
+                          ? t("configView.rawDraftPendingFormTitle")
+                          : formUnsafe
+                            ? t("configView.formUnsafeTitle")
+                            : ""}
                         @click=${() => props.onFormModeChange("form")}
                       >
                         ${t("configView.form")}

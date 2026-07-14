@@ -737,6 +737,7 @@ export class ConfigPage extends OpenClawLightDomElement {
       schemaLoading: configState.configSchemaLoading,
       uiHints: configState.configUiHints,
       formMode: this.formModes[this.pageId],
+      rawDraftPending: configState.configFormMode === "raw" && configState.configFormDirty,
       viewState: this.configViewState,
       rawAvailable: Boolean(
         configState.configSnapshot?.config || configState.configForm || configState.configRaw,

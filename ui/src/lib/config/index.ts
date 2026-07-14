@@ -770,9 +770,14 @@ async function autoSaveConfig(
       state.configFormDirty = true;
     }
     adoptConfigSetAck(state, submittedRaw, ackHash);
-    await loadConfig(state);
-    if (!isCurrent()) {
-      return false;
+    if (!ackHash) {
+      // Only a hashless ack needs a reload to re-derive the snapshot. With a
+      // hash the adopted snapshot IS authoritative, and reloading here would
+      // flash configLoading and lock the editors between keystrokes.
+      await loadConfig(state);
+      if (!isCurrent()) {
+        return false;
+      }
     }
     state.configNeedsApply = true;
     // "Saved" would lie next to a still-dirty draft (edits during the
@@ -1473,7 +1478,9 @@ export function createRuntimeConfigCapability(
       scheduleAutoSave();
       return changed;
     },
-    patch: (options) => run(() => patchConfig(state, options)),
+    // Patches are config writes too: they must honor updater suspension and
+    // register as a drainable flight, or a patch could overlap update.run.
+    patch: (options) => afterPendingWritesSettled(() => patchConfig(state, options)),
     lookupSchemaPath: (path) => run(() => lookupConfigSchemaPath(state, path)),
     subscribe(listener) {
       listeners.add(listener);

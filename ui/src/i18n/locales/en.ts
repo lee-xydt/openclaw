@@ -1287,6 +1287,8 @@ export const en: TranslationMap = {
     rawDiscard: "Discard",
     rawDraftBlocksApply:
       "Unsaved raw config edits — save or discard them in the Raw editor before restarting.",
+    rawDraftPendingFormTitle:
+      "Unsaved raw config edits — save or discard them before switching to Form.",
     rawDraftBlocksFormEdit:
       "Unsaved raw config edits could not be parsed; resolve them in the Raw editor before changing settings.",
     invalidConfig: "Your configuration is invalid. Some settings may not work as expected.",

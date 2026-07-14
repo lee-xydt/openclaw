@@ -1278,6 +1278,75 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
+  it("treats config.patch as a suspendable, drainable write", async () => {
+    vi.useFakeTimers();
+    const patchGate = deferred<unknown>();
+    const patches: unknown[] = [];
+    const request = vi.fn((method: string, params?: unknown) => {
+      if (method === "config.get") {
+        return Promise.resolve({
+          config: { count: 1 },
+          raw: '{\n  "count": 1\n}\n',
+          hash: "hash-1",
+          valid: true,
+          issues: [],
+        });
+      }
+      if (method === "config.patch") {
+        patches.push(params);
+        return patchGate.promise;
+      }
+      return Promise.resolve({});
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    // Suspended (app updater running): patches refuse like save/apply — a
+    // patch is a config write too and could overlap the install.
+    runtimeConfig.setWritesSuspended(true);
+    await expect(runtimeConfig.patch({ raw: { count: 5 } })).resolves.toBe(false);
+    expect(patches).toHaveLength(0);
+    runtimeConfig.setWritesSuspended(false);
+
+    // Once in flight, the updater barrier must wait for it.
+    const patchPromise = runtimeConfig.patch({ raw: { count: 5 } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(patches).toHaveLength(1);
+    let drained = false;
+    const drainPromise = runtimeConfig.waitForPendingWrites().then(() => {
+      drained = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(drained).toBe(false);
+    patchGate.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+    await drainPromise;
+    await expect(patchPromise).resolves.toBe(true);
+    runtimeConfig.dispose();
+  });
+
+  it("adopts the acked autosave without a follow-up reload", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+    const configGetCalls = () =>
+      server.request.mock.calls.filter(([method]) => method === "config.get").length;
+    const getsBefore = configGetCalls();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(server.submissions).toHaveLength(1);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
+    // The acked bytes + hash ARE the snapshot; a config.get here would flash
+    // configLoading and lock the editors between keystrokes.
+    expect(configGetCalls()).toBe(getsBefore);
+    expect(runtimeConfig.state.configSnapshot?.hash).toBe(server.currentHash());
+    runtimeConfig.dispose();
+  });
+
   it("keeps the conflict status through an offline discard", async () => {
     vi.useFakeTimers();
     const request = vi.fn(async (method: string) => {

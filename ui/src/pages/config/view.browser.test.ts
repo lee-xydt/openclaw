@@ -290,6 +290,23 @@ describe("config view", () => {
     expect(onSave).toHaveBeenCalledTimes(1);
   });
 
+  it("pins the raw editor while an unsaved raw draft is authoritative", () => {
+    const { container } = renderConfigView({
+      formMode: "form",
+      rawDraftPending: true,
+      raw: '{\n  "a": 1\n}\n',
+      originalRaw: "{\n}\n",
+      needsApply: true,
+    });
+
+    // The capability refuses form submissions and apply until the raw draft
+    // is saved or discarded — so the raw actions must stay on screen and the
+    // Form toggle + restart action are gated instead of failing generically.
+    expect(container.querySelector(".config-raw-actions")).not.toBeNull();
+    expect(findButtonByText(container, "Form").disabled).toBe(true);
+    expect(findButtonByText(container, "Restart & apply").disabled).toBe(true);
+  });
+
   it("disables raw save/discard without changes and locks the editor while busy", () => {
     const clean = renderConfigView({
       formMode: "raw",
