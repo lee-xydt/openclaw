@@ -579,6 +579,17 @@ function installControlUiMockGateway(input: {
         };
       }
       if (method === "config.set" || method === "config.apply") {
+        // Enforce the production CAS contract: stale base hashes are rejected
+        // (same code/message as the gateway) so conflict recovery is testable.
+        const baseHash = isRecord(params) ? params.baseHash : undefined;
+        if (baseHash !== mockConfigHash()) {
+          return {
+            __mockError: {
+              code: "INVALID_REQUEST",
+              message: "config changed since last load; re-run config.get and retry",
+            },
+          };
+        }
         const raw = isRecord(params) && typeof params.raw === "string" ? params.raw : null;
         if (raw !== null) {
           configState = { raw, revision: configState.revision + 1 };
@@ -877,12 +888,14 @@ function installControlUiMockGateway(input: {
         return;
       }
       window.setTimeout(() => {
-        this.deliver({
-          id,
-          ok: true,
-          payload: buildResponse(method, frame.params),
-          type: "res",
-        });
+        const payload = buildResponse(method, frame.params);
+        const mockError =
+          isRecord(payload) && isRecord(payload.__mockError) ? payload.__mockError : null;
+        this.deliver(
+          mockError
+            ? { id, ok: false, error: mockError, type: "res" }
+            : { id, ok: true, payload, type: "res" },
+        );
         if (
           method === "chat.abort" &&
           isRecord(frame.params) &&

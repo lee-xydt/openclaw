@@ -1641,7 +1641,9 @@ export function renderConfig(props: ConfigProps) {
     formMode === "raw" && hasRawChanges && viewState.rawDiffOpen
       ? computeRawDiff(viewState, props.originalRaw, props.raw)
       : [];
-  const configBusy = props.loading || props.saving || props.applying;
+  // Includes the app updater: writes are suspended while it runs, so raw
+  // Save/Discard must read busy instead of silently no-opping.
+  const configBusy = props.loading || props.saving || props.applying || props.updating;
   const canRawSave = props.connected && !configBusy && hasRawChanges;
   const autoSaveStatus = renderConfigAutoSaveStatus({
     status: props.autoSaveStatus,
