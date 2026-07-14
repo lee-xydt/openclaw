@@ -1069,6 +1069,7 @@ export function renderQuickSettings(props: QuickSettingsProps) {
       busy:
         props.configSaving === true ||
         props.configLoading === true ||
+        props.configUpdating === true ||
         props.configAutoSaveStatus === "saving",
       connected: props.connected,
       onApply: () => props.onApplyConfig?.(),

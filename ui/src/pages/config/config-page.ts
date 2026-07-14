@@ -729,6 +729,7 @@ export class ConfigPage extends OpenClawLightDomElement {
       loading: configState.configLoading,
       saving: configState.configSaving,
       applying: configState.configApplying,
+      updating: this.isUpdateBusy(),
       autoSaveStatus: configState.configAutoSaveStatus,
       needsApply: configState.configNeedsApply,
       connected: configState.connected,

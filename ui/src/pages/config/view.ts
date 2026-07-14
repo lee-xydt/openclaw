@@ -114,6 +114,8 @@ export type ConfigProps = {
   loading: boolean;
   saving: boolean;
   applying: boolean;
+  /** App updater running; config writes and restarts are interlocked. */
+  updating: boolean;
   autoSaveStatus: ConfigAutoSaveStatus;
   needsApply: boolean;
   connected: boolean;
@@ -1736,8 +1738,14 @@ export function renderConfig(props: ConfigProps) {
     applying: props.applying,
     // Applying mid-save/mid-load would race the write that made the banner
     // appear (or a stale snapshot); a dirty raw draft blocks apply outright
-    // (raw is explicit-save-only). Wait for quiet.
-    busy: props.saving || props.loading || props.autoSaveStatus === "saving" || hasRawChanges,
+    // (raw is explicit-save-only); restarting mid-update can corrupt the
+    // install. Wait for quiet.
+    busy:
+      props.saving ||
+      props.loading ||
+      props.updating ||
+      props.autoSaveStatus === "saving" ||
+      hasRawChanges,
     connected: props.connected,
     onApply: props.onApply,
   });

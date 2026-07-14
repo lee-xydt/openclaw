@@ -436,6 +436,13 @@ describe("renderQuickSettings", () => {
     expect(container.querySelector(".config-apply-banner button")?.hasAttribute("disabled")).toBe(
       true,
     );
+    render(
+      renderQuickSettings(createProps({ configNeedsApply: true, configUpdating: true })),
+      container,
+    );
+    expect(container.querySelector(".config-apply-banner button")?.hasAttribute("disabled")).toBe(
+      true,
+    );
   });
 
   it("locks config-backed quick controls while a config operation is pending", () => {

@@ -135,6 +135,8 @@ export type RuntimeConfigCapability = {
   resetDraft: () => void;
   /** Discards pending edits: reloads from disk when connected, else resets locally. */
   discardDraft: () => Promise<void>;
+  /** Pauses/resumes all config writes (autosave + manual) while e.g. the app updater runs. */
+  setWritesSuspended: (suspended: boolean) => void;
   save: () => Promise<boolean>;
   apply: () => Promise<boolean>;
   openFile: () => Promise<void>;
@@ -612,6 +614,7 @@ async function submitConfigChange(
   method: ConfigSubmitMethod,
   busyKey: ConfigSubmitBusyKey,
   extraParams: Record<string, unknown> = {},
+  onSubmitted?: (info: { raw: string; ackHash: string | null }) => void,
 ): Promise<boolean> {
   const client = state.client;
   if (!client || !state.connected) {
@@ -635,6 +638,9 @@ async function submitConfigChange(
     // from the ack — the write is durable even if this connection just went
     // stale — and adopt it as the new draft base.
     const ackHash = readAckHash(ack);
+    // Reported before the epoch check: dispose-chained teardown flushes need
+    // this flight's own submission even though state mutation may be blocked.
+    onSubmitted?.({ raw, ackHash });
     if (method === "config.set" && ackHash) {
       storeNeedsApplyHash(ackHash);
     }
@@ -812,8 +818,11 @@ function resetStaleAutoSaveStatus(state: ConfigState) {
   state.configAutoSaveStatus = "idle";
 }
 
-async function saveConfig(state: ConfigState): Promise<boolean> {
-  return submitConfigChange(state, "config.set", "configSaving");
+async function saveConfig(
+  state: ConfigState,
+  onSubmitted?: (info: { raw: string; ackHash: string | null }) => void,
+): Promise<boolean> {
+  return submitConfigChange(state, "config.set", "configSaving", {}, onSubmitted);
 }
 
 async function applyConfig(state: ConfigState): Promise<boolean> {
@@ -1154,6 +1163,13 @@ export function createRuntimeConfigCapability(
   // Blocks trailing autosaves while a discard drains pending writes; the
   // drained draft is about to be thrown away, not re-written.
   let suppressAutoSave = false;
+  // App-updater interlock: config writes or gateway restarts mid-update can
+  // corrupt the install, so all writes pause until the updater settles.
+  let writesSuspended = false;
+  // Submission info of the pending manual SAVE (applies never register:
+  // a post-apply write is meaningless while the gateway restarts, so the
+  // teardown flush fail-closes on them).
+  let manualFlightInfo: { raw: string; ackHash: string | null } | null = null;
 
   const publish = () => {
     if (disposed) {
@@ -1205,7 +1221,7 @@ export function createRuntimeConfigCapability(
     autoSaveTrailing = false;
   };
   const runAutoSave = () => {
-    if (disposed || suppressAutoSave) {
+    if (disposed || suppressAutoSave || writesSuspended) {
       return;
     }
     if (autoSaveInFlight) {
@@ -1245,8 +1261,9 @@ export function createRuntimeConfigCapability(
   };
   const scheduleAutoSave = () => {
     // Only form-draft edits auto-save; raw-text drafts stay manual so a
-    // half-typed JSON5 buffer never gets written to disk.
-    if (disposed || !state.configFormDirty || state.configFormMode !== "form") {
+    // half-typed JSON5 buffer never gets written to disk. Suspended writes
+    // (app updater running) stay dirty and reschedule when suspension lifts.
+    if (disposed || writesSuspended || !state.configFormDirty || state.configFormMode !== "form") {
       return;
     }
     if (autoSaveTimer) {
@@ -1273,6 +1290,9 @@ export function createRuntimeConfigCapability(
     }
   };
   const afterPendingWritesSettled = (task: () => Promise<boolean>): Promise<boolean> => {
+    if (writesSuspended) {
+      return Promise.resolve(false);
+    }
     cancelScheduledAutoSave();
     return run(async () => {
       // Drain before the explicit op — otherwise an apply could race a
@@ -1282,6 +1302,7 @@ export function createRuntimeConfigCapability(
       if (autoSaveInFlight ?? manualSubmitInFlight) {
         await drainPendingWrites();
       }
+      manualFlightInfo = null;
       const submit = task();
       const settled = submit
         .catch(() => false)
@@ -1385,11 +1406,31 @@ export function createRuntimeConfigCapability(
       // draft; fall back to a pure local reset onto the snapshot originals.
       mutate(() => {
         resetConfigPendingChanges(state);
-        state.configAutoSaveStatus = "idle";
-        state.lastError = null;
+        // Conflict marks the snapshot itself stale; an offline reset onto
+        // those stale originals must NOT pretend to have reconciled — only a
+        // connected reload clears conflict (same invariant as elsewhere).
+        if (state.configAutoSaveStatus !== "conflict") {
+          state.configAutoSaveStatus = "idle";
+          state.lastError = null;
+        }
       });
     },
-    save: () => afterPendingWritesSettled(() => saveConfig(state)),
+    setWritesSuspended: (suspended) => {
+      if (writesSuspended === suspended) {
+        return;
+      }
+      writesSuspended = suspended;
+      if (!suspended) {
+        // Edits made during the update save once it ends.
+        scheduleAutoSave();
+      }
+    },
+    save: () =>
+      afterPendingWritesSettled(() =>
+        saveConfig(state, (info) => {
+          manualFlightInfo = info;
+        }),
+      ),
     apply: () =>
       afterPendingWritesSettled(async () => {
         // Checked after the drain: a raw draft whose explicit Save is in
@@ -1430,19 +1471,32 @@ export function createRuntimeConfigCapability(
       // stale-epoch guards skip all state mutation once the connection is
       // invalidated below.
       const client = state.client;
-      const canFlush = state.connected && client !== null && state.configFormMode === "form";
-      const pendingFlight = autoSaveInFlight;
-      const flightRaw = lastFlightSubmittedRaw;
+      const canFlush =
+        state.connected && client !== null && state.configFormMode === "form" && !writesSuspended;
+      const autoFlight = autoSaveInFlight;
+      const pendingFlight = autoFlight ?? manualSubmitInFlight;
       cancelScheduledAutoSave();
       if (canFlush && pendingFlight) {
         void pendingFlight.then(() => {
           // The settled flight could not update dirty/base state past the
           // epoch guard; a draft whose bytes differ from that submission is a
-          // newer edit and gets exactly one final save. Without the flight's
-          // own ack hash there is no CAS base we can trust — skip (fail
-          // closed) rather than risk clobbering a foreign write.
-          const ackHash = lastFlightAckHash;
-          if (ackHash && state.configFormDirty && serializeFormForSubmit(state) !== flightRaw) {
+          // newer edit and gets exactly one chained final save — never a
+          // parallel one. Auto flights report via lastFlight*, manual saves
+          // via manualFlightInfo; applies never register info (a post-apply
+          // write is meaningless while the gateway restarts), and without the
+          // flight's own ack hash there is no CAS base we can trust — both
+          // fail closed rather than risk clobbering a foreign write.
+          const submitted = autoFlight
+            ? { raw: lastFlightSubmittedRaw, ackHash: lastFlightAckHash }
+            : manualFlightInfo;
+          const ackHash = submitted?.ackHash ?? null;
+          const submittedRaw = submitted?.raw ?? null;
+          if (
+            ackHash &&
+            submittedRaw !== null &&
+            state.configFormDirty &&
+            serializeFormForSubmit(state) !== submittedRaw
+          ) {
             teardownFlushConfigDraft(state, client, ackHash);
           }
         });

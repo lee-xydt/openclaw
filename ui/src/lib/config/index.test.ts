@@ -1252,6 +1252,132 @@ describe("config form auto-save", () => {
     runtimeConfig.dispose();
   });
 
+  it("suspends config writes while the app updater runs and resumes after", async () => {
+    vi.useFakeTimers();
+    const server = createConfigServerMock();
+    const { runtimeConfig } = createHarness(server.request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.setWritesSuspended(true);
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS * 3);
+    expect(server.submissions).toHaveLength(0);
+    expect(runtimeConfig.state.configFormDirty).toBe(true);
+
+    // Manual writes refuse too: config writes mid-update can corrupt the install.
+    await expect(runtimeConfig.save()).resolves.toBe(false);
+    await expect(runtimeConfig.apply()).resolves.toBe(false);
+    expect(server.submissions).toHaveLength(0);
+
+    // Edits made during the update save once it ends.
+    runtimeConfig.setWritesSuspended(false);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(server.submissions).toEqual([
+      { method: "config.set", raw: '{\n  "count": 2\n}\n', baseHash: "hash-1" },
+    ]);
+    runtimeConfig.dispose();
+  });
+
+  it("keeps the conflict status through an offline discard", async () => {
+    vi.useFakeTimers();
+    const request = vi.fn(async (method: string) => {
+      if (method === "config.get") {
+        return {
+          config: { count: 1 },
+          raw: '{\n  "count": 1\n}\n',
+          hash: "hash-1",
+          valid: true,
+          issues: [],
+        };
+      }
+      if (method === "config.set") {
+        throw new Error("config changed since last load; re-run config.get and retry");
+      }
+      return {};
+    });
+    const { runtimeConfig, publish } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("conflict");
+
+    // Offline discard resets the draft locally but must not pretend the
+    // stale snapshot was reconciled; only a connected reload clears conflict.
+    publish(false);
+    await runtimeConfig.discardDraft();
+    expect(runtimeConfig.state.configFormDirty).toBe(false);
+    expect(runtimeConfig.state.configRaw).toBe('{\n  "count": 1\n}\n');
+    expect(runtimeConfig.state.configAutoSaveStatus).toBe("conflict");
+    runtimeConfig.dispose();
+  });
+
+  it("chains the teardown flush behind a pending manual save", async () => {
+    vi.useFakeTimers();
+    stubLocalStorage();
+    const { request, submissions, firstSet } = createDeferredSetServerMock();
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    const savePromise = runtimeConfig.save();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(submissions).toHaveLength(1);
+
+    runtimeConfig.patchForm(["count"], 3);
+    runtimeConfig.dispose();
+    firstSet.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+    await savePromise;
+
+    // Exactly one chained flush, based on the manual save's own ack hash —
+    // never a parallel write against the same base.
+    expect(submissions).toEqual([
+      { raw: '{\n  "count": 2\n}\n', baseHash: "hash-1" },
+      { raw: '{\n  "count": 3\n}\n', baseHash: "hash-2" },
+    ]);
+  });
+
+  it("skips the teardown flush behind a pending apply", async () => {
+    vi.useFakeTimers();
+    stubLocalStorage();
+    const firstApply = deferred<unknown>();
+    let setCalls = 0;
+    const request = vi.fn((method: string) => {
+      if (method === "config.get") {
+        return Promise.resolve({
+          config: { count: 1 },
+          raw: '{\n  "count": 1\n}\n',
+          hash: "hash-1",
+          valid: true,
+          issues: [],
+        });
+      }
+      if (method === "config.set") {
+        setCalls += 1;
+        return Promise.resolve({ hash: "hash-9" });
+      }
+      if (method === "config.apply") {
+        return firstApply.promise.then(() => ({ hash: "hash-2" }));
+      }
+      return Promise.resolve({});
+    });
+    const { runtimeConfig } = createHarness(request as GatewayBrowserClient["request"]);
+    await runtimeConfig.ensureLoaded();
+
+    runtimeConfig.patchForm(["count"], 2);
+    const applyPromise = runtimeConfig.apply();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The gateway is about to restart; a post-apply write is meaningless.
+    runtimeConfig.patchForm(["count"], 3);
+    runtimeConfig.dispose();
+    firstApply.resolve({});
+    await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
+    await applyPromise;
+    expect(setCalls).toBe(0);
+  });
+
   it("never auto-saves raw-text drafts and submits them on manual save", async () => {
     vi.useFakeTimers();
     const server = createConfigServerMock();

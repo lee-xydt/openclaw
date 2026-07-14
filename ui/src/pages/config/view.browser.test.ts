@@ -14,6 +14,7 @@ describe("config view", () => {
     loading: false,
     saving: false,
     applying: false,
+    updating: false,
     autoSaveStatus: "idle" as const,
     needsApply: false,
     connected: true,
@@ -252,6 +253,7 @@ describe("config view", () => {
     for (const overrides of [
       { saving: true },
       { loading: true },
+      { updating: true },
       { autoSaveStatus: "saving" as const },
       { formMode: "raw" as const, raw: '{\n  "a": 1\n}\n', originalRaw: "{\n}\n" },
     ]) {
