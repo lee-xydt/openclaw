@@ -596,7 +596,7 @@ describe("minimax provider hooks", () => {
     expect(resolveApiKeyFromConfigAndStore).not.toHaveBeenCalled();
   });
 
-  it("routes portal usage snapshots to the global base URL with zero-total coding-plan payload", async () => {
+  it("routes portal usage snapshots via the configured base URL for coding-plan payloads", async () => {
     const { providers } = await registerProviderPlugin({
       plugin: minimaxProviderPlugin,
       id: "minimax",
@@ -606,25 +606,51 @@ describe("minimax provider hooks", () => {
     const fetchFn = vi.fn(async (input: string | URL | Request) => {
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      // Portal provider must resolve to the global usage origin, not the CN default.
-      expect(url).toBe("https://api.minimax.io/v1/token_plan/remains");
+      // MiniMax coding-plan keys are CN-only; the usage URL derives from
+      // the configured minimax-portal base URL origin.
+      expect(url).toBe("https://api.minimaxi.com/v1/token_plan/remains");
+      // Real MiniMax coding-plan API response shape (verified against a live
+      // coding-plan key, 2026-07-23).  model_remains sits at the top level
+      // alongside base_resp, without a wrapper `data` key.
       return new Response(
         JSON.stringify({
           base_resp: { status_code: 0, status_msg: "success" },
-          data: {
-            model_remains: [
-              {
-                model_name: "general",
-                current_interval_total_count: 0,
-                current_interval_usage_count: 0,
-                current_interval_remaining_percent: 97,
-              },
-              {
-                model_name: "video",
-                current_interval_remaining_percent: 100,
-              },
-            ],
-          },
+          model_remains: [
+            {
+              start_time: 1_784_808_000_000,
+              end_time: 1_784_822_400_000,
+              remains_time: 12_171_640,
+              current_interval_total_count: 0,
+              current_interval_usage_count: 0,
+              model_name: "general",
+              current_weekly_total_count: 0,
+              current_weekly_usage_count: 0,
+              weekly_start_time: 1_784_476_800_000,
+              weekly_end_time: 1_785_081_600_000,
+              weekly_remains_time: 271_371_640,
+              current_interval_status: 1,
+              current_interval_remaining_percent: 100,
+              current_weekly_status: 1,
+              current_weekly_remaining_percent: 79,
+            },
+            {
+              start_time: 1_784_736_000_000,
+              end_time: 1_784_822_400_000,
+              remains_time: 12_171_640,
+              current_interval_total_count: 0,
+              current_interval_usage_count: 0,
+              model_name: "video",
+              current_weekly_total_count: 0,
+              current_weekly_usage_count: 0,
+              weekly_start_time: 1_784_476_800_000,
+              weekly_end_time: 1_785_081_600_000,
+              weekly_remains_time: 271_371_640,
+              current_interval_status: 3,
+              current_interval_remaining_percent: 100,
+              current_weekly_status: 3,
+              current_weekly_remaining_percent: 100,
+            },
+          ],
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
@@ -636,7 +662,7 @@ describe("minimax provider hooks", () => {
         models: {
           providers: {
             "minimax-portal": {
-              baseUrl: "https://api.minimax.io/anthropic",
+              baseUrl: "https://api.minimaxi.com/anthropic",
               models: [],
             },
           },
@@ -650,7 +676,7 @@ describe("minimax provider hooks", () => {
 
     expect(result?.error).toBeUndefined();
     expect(result?.plan).toBe("Coding Plan · general");
-    expect(result?.windows).toEqual([{ label: "5h", usedPercent: 3, resetAt: undefined }]);
+    expect(result?.windows).toEqual([{ label: "4h", usedPercent: 0, resetAt: 1_784_822_400_000 }]);
   });
 
   it("writes api and authHeader into the MiniMax portal OAuth config patch", async () => {
