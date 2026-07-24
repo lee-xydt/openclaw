@@ -1,6 +1,7 @@
 import type { ReactiveController, ReactiveControllerHost } from "lit";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as assistantIdentity from "../../app/assistant-identity.ts";
+import type { ApplicationContext } from "../../app/context.ts";
 import { createInitialUserMessageHandoff } from "../../app/initial-user-message-handoff.ts";
 import {
   buildFallbackSlashCommands,
@@ -17,6 +18,7 @@ import {
 } from "./chat-queue.ts";
 import {
   ChatStateController,
+  createPageState,
   handlePageGatewayEvent,
   refreshChatMetadata,
   resetChatStateForRouteSession,
@@ -432,7 +434,7 @@ describe("ChatStateController render lifecycle", () => {
     expect(painted).not.toHaveBeenCalled();
   });
 
-  it("invalidates the composer render lifecycle when a handled history key mutates the draft", () => {
+  it("invalidates the render lifecycle when input history recall mutates the draft", () => {
     const requestUpdate = vi.fn();
     const host = {
       addController: () => undefined,
@@ -443,43 +445,38 @@ describe("ChatStateController render lifecycle", () => {
     const controller = new ChatStateController<ChatPageHost>(host);
     controller.hostConnected();
     const renderLifecycle = controller.createRenderLifecycle();
-    const invalidate = vi.fn();
-    renderLifecycle.invalidate = invalidate;
+
+    const navigateHistory = vi.fn().mockReturnValue({
+      handled: true,
+      preventDefault: true,
+      restoreCaret: "up" as const,
+      decision: "handled:history-up" as const,
+      historyNavigationActiveBefore: false,
+      historyNavigationActiveAfter: true,
+      selectionStart: 0,
+      selectionEnd: 0,
+      valueLength: 10,
+    });
 
     const state = {
+      settings: undefined,
+      assistantAgentId: null,
+      agentsList: null,
+      hello: null,
       sessionKey: "agent:main:current",
       chatLoading: false,
-      chatMessage: "",
       chatMessages: [],
-      chatLocalInputHistoryBySession: {
-        "agent:main:current": [{ text: "remembered prompt", ts: 1 }],
-      },
-      chatInputHistorySessionKey: null,
-      chatInputHistoryItems: null,
-      chatInputHistoryIndex: -1,
-      chatDraftBeforeHistory: null,
+      chatQueue: [],
       renderLifecycle,
-      requestUpdate: vi.fn(),
-      handleChatInputHistoryKey: (input: { key: "ArrowUp" | "ArrowDown" }) => {
-        if (input.key !== "ArrowUp" || state.chatMessage !== "") {
-          return { handled: false };
-        }
-        const recalled = state.chatLocalInputHistoryBySession[state.sessionKey]?.[0]?.text;
-        if (!recalled) {
-          return { handled: false };
-        }
-        state.chatMessage = recalled;
-        state.chatInputHistoryItems = [recalled];
-        state.chatInputHistorySessionKey = state.sessionKey;
-        state.chatInputHistoryIndex = 0;
-        return { handled: true };
-      },
+      handleSendChat: vi.fn().mockResolvedValue(undefined),
+      handleChatDraftChange: vi.fn(),
+      handleChatInputHistoryKey: navigateHistory,
     } as unknown as ChatPageHost;
 
     controller.attach(state);
 
-    const result = state.handleChatInputHistoryKey({
-      key: "ArrowUp",
+    const input = {
+      key: "ArrowUp" as const,
       selectionStart: 0,
       selectionEnd: 0,
       valueLength: 0,
@@ -489,10 +486,72 @@ describe("ChatStateController render lifecycle", () => {
       shiftKey: false,
       isComposing: false,
       keyCode: 0,
-    });
+    };
+    const result = state.handleChatInputHistoryKey!(input);
 
     expect(result.handled).toBe(true);
-    expect(invalidate).toHaveBeenCalledOnce();
+    expect(navigateHistory).toHaveBeenCalledWith(input);
+    expect(requestUpdate).toHaveBeenCalled();
+  });
+
+  it("does not invalidate the render lifecycle when input history key is not handled", () => {
+    const requestUpdate = vi.fn();
+    const host = {
+      addController: () => undefined,
+      removeController: () => undefined,
+      requestUpdate,
+      updateComplete: Promise.resolve(true),
+    } satisfies ReactiveControllerHost;
+    const controller = new ChatStateController<ChatPageHost>(host);
+    controller.hostConnected();
+    const renderLifecycle = controller.createRenderLifecycle();
+
+    const navigateHistory = vi.fn().mockReturnValue({
+      handled: false,
+      preventDefault: false,
+      restoreCaret: null,
+      decision: "blocked:modifier-or-composition" as const,
+      historyNavigationActiveBefore: false,
+      historyNavigationActiveAfter: false,
+      selectionStart: 0,
+      selectionEnd: 0,
+      valueLength: 10,
+    });
+
+    const state = {
+      settings: undefined,
+      assistantAgentId: null,
+      agentsList: null,
+      hello: null,
+      sessionKey: "agent:main:current",
+      chatLoading: false,
+      chatMessages: [],
+      chatQueue: [],
+      renderLifecycle,
+      handleSendChat: vi.fn().mockResolvedValue(undefined),
+      handleChatDraftChange: vi.fn(),
+      handleChatInputHistoryKey: navigateHistory,
+    } as unknown as ChatPageHost;
+
+    controller.attach(state);
+
+    const input = {
+      key: "ArrowUp" as const,
+      selectionStart: 5,
+      selectionEnd: 5,
+      valueLength: 10,
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      isComposing: false,
+      keyCode: 0,
+    };
+    const result = state.handleChatInputHistoryKey!(input);
+
+    expect(result.handled).toBe(false);
+    expect(navigateHistory).toHaveBeenCalledWith(input);
+    expect(requestUpdate).not.toHaveBeenCalled();
   });
 });
 
@@ -658,6 +717,51 @@ describe("session pull request refresh", () => {
   });
 });
 
+describe("image lightbox lifecycle", () => {
+  it("invalidates immediately when beginning a deferred image open", () => {
+    const invalidate = vi.fn();
+    const context = {
+      agents: {
+        state: { agentsList: null },
+        adoptList: vi.fn(),
+      },
+      agentSelection: { state: { selectedId: "main" } },
+      basePath: "",
+      config: {
+        current: {
+          allowExternalEmbedUrls: false,
+          assistantIdentity: { name: "Assistant" },
+          embedSandboxMode: "scripts",
+          localMediaPreviewRoots: [],
+        },
+      },
+      initialUserMessage: createInitialUserMessageHandoff(),
+      sessions: {},
+    } as unknown as ApplicationContext;
+    const state = createPageState(
+      context,
+      {
+        invalidate,
+        afterCommit: () => () => {},
+      },
+      { querySelector: () => null },
+    );
+    const release = vi.fn();
+    state.imageLightbox = {
+      src: "blob:managed-image",
+      title: "Generated image",
+      release,
+    };
+
+    const requestVersion = state.beginImageOpen();
+
+    expect(requestVersion).toBe(1);
+    expect(state.imageLightbox).toBeNull();
+    expect(release).toHaveBeenCalledOnce();
+    expect(invalidate).toHaveBeenCalledOnce();
+  });
+});
+
 describe("route composer fallback", () => {
   function createRouteState(chatMessage: string) {
     const resetChatInputHistoryNavigation = vi.fn();
@@ -675,6 +779,8 @@ describe("route composer fallback", () => {
       chatQueueByScope: {},
       chatMessages: [],
       chatMessagesBySession: new Map(),
+      imageLightbox: null,
+      imageLightboxRequestVersion: 0,
       chatAttachments: [
         {
           id: "staged-image",
@@ -697,17 +803,34 @@ describe("route composer fallback", () => {
     return { resetChatInputHistoryNavigation, resetChatScroll, state };
   }
 
+  it("releases the active image lightbox on a route switch", () => {
+    const { state } = createRouteState("");
+    const release = vi.fn();
+    state.imageLightbox = {
+      src: "blob:managed-image",
+      title: "Generated image",
+      release,
+    };
+
+    resetChatStateForRouteSession(state, "agent:main:second");
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(state.imageLightbox).toBeNull();
+  });
+
   it("restores one atomic history snapshot when returning to a session", () => {
     vi.stubGlobal("sessionStorage", createStorageMock());
     const { state } = createRouteState("");
     state.chatMessages = [{ role: "assistant", content: "first session" }];
     state.chatHistoryPagination = { hasMore: true, nextOffset: 400, totalMessages: 718 };
     state.currentSessionId = "session-first";
+    state.chatDisplayedLeafEntryId = "leaf-first";
 
     resetChatStateForRouteSession(state, "agent:main:second");
     state.chatMessages = [{ role: "assistant", content: "second session" }];
     state.chatHistoryPagination = { hasMore: false, totalMessages: 1 };
     state.currentSessionId = "session-second";
+    state.chatDisplayedLeafEntryId = "leaf-second";
 
     resetChatStateForRouteSession(state, "agent:main:first");
 
@@ -718,6 +841,7 @@ describe("route composer fallback", () => {
       totalMessages: 718,
     });
     expect(state.currentSessionId).toBe("session-first");
+    expect(state.chatDisplayedLeafEntryId).toBe("leaf-first");
   });
 
   it("reapplies a live send projection when a subscribed pane switches into its scope", () => {
